@@ -1,0 +1,3 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { JobsPage } from "@/components/karna-pages";
+export const Route = createFileRoute("/jobs")({ head: () => ({ meta: [{ title: "Job Matching — KARNA AI" }, { name: "description", content: "Compare a target job description with your career profile." }, { property: "og:title", content: "Job Matching — KARNA AI" }, { property: "og:description", content: "See matched skills, missing skills, and profile alignment." }, { property: "og:type", content: "website" }, { name: "twitter:card", content: "summary" }] }), component: JobsPage });

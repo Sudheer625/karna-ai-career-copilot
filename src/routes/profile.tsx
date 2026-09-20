@@ -1,0 +1,3 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { ProfilePage } from "@/components/karna-pages";
+export const Route = createFileRoute("/profile")({ head: () => ({ meta: [{ title: "Profile — KARNA AI" }, { name: "description", content: "Manage your demo student profile and skills." }, { property: "og:title", content: "Profile — KARNA AI" }, { property: "og:description", content: "Keep your career identity ready for analysis." }, { property: "og:type", content: "website" }, { name: "twitter:card", content: "summary" }] }), component: ProfilePage });

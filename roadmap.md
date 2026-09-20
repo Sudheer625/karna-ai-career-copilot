@@ -1,0 +1,4 @@
+- [ ] Replace placeholder with KARNA AI landing page and public auth flows
+- [ ] Add shared demo data, service boundaries, primitives, and responsive app shell
+- [ ] Add dashboard, resume, jobs, skills, roadmap, interview, profile, and settings pages
+- [ ] Add route-specific metadata and verify navigation plus responsive preview

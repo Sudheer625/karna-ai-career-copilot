@@ -1,0 +1,3 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { InterviewPage } from "@/components/karna-pages";
+export const Route = createFileRoute("/interview")({ head: () => ({ meta: [{ title: "Interview Preparation — KARNA AI" }, { name: "description", content: "Practice role-specific interview questions with focused feedback." }, { property: "og:title", content: "Interview Preparation — KARNA AI" }, { property: "og:description", content: "Rehearse technical, HR, and project questions." }, { property: "og:type", content: "website" }, { name: "twitter:card", content: "summary" }] }), component: InterviewPage });

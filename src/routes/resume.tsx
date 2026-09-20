@@ -1,0 +1,3 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { ResumePage } from "@/components/karna-pages";
+export const Route = createFileRoute("/resume")({ head: () => ({ meta: [{ title: "Resume Analyzer — KARNA AI" }, { name: "description", content: "Upload a resume and review AI-generated career insights." }, { property: "og:title", content: "Resume Analyzer — KARNA AI" }, { property: "og:description", content: "Understand your resume strengths and next improvements." }, { property: "og:type", content: "website" }, { name: "twitter:card", content: "summary" }] }), component: ResumePage });
