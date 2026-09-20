@@ -1,0 +1,3 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { RoadmapPage } from "@/components/karna-pages";
+export const Route = createFileRoute("/roadmap")({ head: () => ({ meta: [{ title: "Career Roadmap — KARNA AI" }, { name: "description", content: "Follow a personalized, phased plan toward your target role." }, { property: "og:title", content: "Career Roadmap — KARNA AI" }, { property: "og:description", content: "Turn skill gaps into a practical learning sequence." }, { property: "og:type", content: "website" }, { name: "twitter:card", content: "summary" }] }), component: RoadmapPage });

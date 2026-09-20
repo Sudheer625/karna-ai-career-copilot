@@ -1,0 +1,3 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { SettingsPage } from "@/components/karna-pages";
+export const Route = createFileRoute("/settings")({ head: () => ({ meta: [{ title: "Settings — KARNA AI" }, { name: "description", content: "Manage appearance, notifications, account, and privacy preferences." }, { property: "og:title", content: "Settings — KARNA AI" }, { property: "og:description", content: "Manage your KARNA AI workspace preferences." }, { property: "og:type", content: "website" }, { name: "twitter:card", content: "summary" }] }), component: SettingsPage });
