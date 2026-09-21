@@ -1,3 +1,18 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { LoginPage } from "@/components/karna-pages";
-export const Route = createFileRoute("/login")({ head: () => ({ meta: [{ title: "Sign in — KARNA AI" }, { name: "description", content: "Sign in to your KARNA AI career workspace." }, { property: "og:title", content: "Sign in — KARNA AI" }, { property: "og:description", content: "Continue your career readiness journey with KARNA AI." }, { property: "og:type", content: "website" }, { name: "twitter:card", content: "summary" }] }), component: LoginPage });
+import { SupabaseLoginPage } from "@/components/karna-pages";
+export const Route = createFileRoute("/login")({
+  head: () => ({
+    meta: [
+      { title: "Sign in — KARNA AI" },
+      { name: "description", content: "Sign in to your KARNA AI career workspace." },
+      { property: "og:title", content: "Sign in — KARNA AI" },
+      {
+        property: "og:description",
+        content: "Continue your career readiness journey with KARNA AI.",
+      },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary" },
+    ],
+  }),
+  component: SupabaseLoginPage,
+});
