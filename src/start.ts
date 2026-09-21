@@ -2,9 +2,9 @@ import { createStart, createCsrfMiddleware, createMiddleware } from "@tanstack/r
 
 import { renderErrorPage } from "./lib/error-page";
 
-const errorMiddleware = createMiddleware().server(async ({ next }) => {
+const errorMiddleware = createMiddleware().server(async ({ next, request }) => {
   try {
-    return await next();
+    return await next({ context: { request } });
   } catch (error) {
     if (error != null && typeof error === "object" && "statusCode" in error) {
       throw error;

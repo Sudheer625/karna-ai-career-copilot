@@ -77,6 +77,7 @@ import {
   deleteResume,
   getResumeDownloadUrl,
   listUserResumes,
+  processUserResume,
   uploadResume,
   type Resume,
 } from "@/lib/resume-service";
@@ -511,12 +512,17 @@ function formatFileSize(fileSize: number): string {
   return `${(fileSize / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatResumeStatus(status: string): string {
+  return status.charAt(0).toUpperCase() + status.slice(1);
+}
+
 export function ResumePage() {
   const { user, isLoading: authLoading } = useAuth();
   const [resumes, setResumes] = useState<Resume[]>([]);
   const [listLoading, setListLoading] = useState(true);
   const [uploadLoading, setUploadLoading] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [processingId, setProcessingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const loadResumes = useCallback(async () => {
     if (!user) {
@@ -565,6 +571,26 @@ export function ResumePage() {
     }
   };
 
+  const handleProcess = async (resumeId: string) => {
+    setError(null);
+    setProcessingId(resumeId);
+    setResumes((current) =>
+      current.map((resume) =>
+        resume.id === resumeId ? { ...resume, status: "processing", processing_error: null } : resume,
+      ),
+    );
+    try {
+      await processUserResume(resumeId);
+      await loadResumes();
+      toast.success("Resume processed successfully.");
+    } catch (processError) {
+      await loadResumes();
+      setError(processError instanceof Error ? processError.message : "We could not process your resume.");
+    } finally {
+      setProcessingId(null);
+    }
+  };
+
   const handleDownload = async (resumeId: string) => {
     setError(null);
     try {
@@ -602,16 +628,41 @@ export function ResumePage() {
                     <div className="min-w-0 flex-1">
                       <p className="truncate text-sm font-medium">{resume.file_name}</p>
                       <p className="text-xs text-muted-foreground">
-                        {formatFileSize(resume.file_size)} · {resume.status}
+                        {formatFileSize(resume.file_size)} · {formatResumeStatus(resume.status)}
                       </p>
+                      {resume.status === "processed" && (
+                        <p className="mt-1 text-xs text-success">
+                          Resume processed successfully
+                          {resume.extracted_text
+                            ? ` · ${resume.extracted_text.length.toLocaleString()} characters`
+                            : ""}
+                        </p>
+                      )}
+                      {resume.status === "failed" && resume.processing_error && (
+                        <p className="mt-1 text-xs text-destructive">{resume.processing_error}</p>
+                      )}
                     </div>
+                    {(resume.status === "uploaded" ||
+                      resume.status === "failed" ||
+                      resume.status === "processing") && (
+                      <Button
+                        variant="outline"
+                        className="h-8 shrink-0 rounded-lg px-2 text-xs"
+                        onClick={() => void handleProcess(resume.id)}
+                        disabled={resume.status === "processing" || processingId === resume.id}
+                      >
+                        {resume.status === "processing" || processingId === resume.id
+                          ? "Processing"
+                          : "Process Resume"}
+                      </Button>
+                    )}
                     <Button
                       variant="ghost"
                       size="icon"
                       title="View resume"
                       aria-label={`View ${resume.file_name}`}
                       onClick={() => void handleDownload(resume.id)}
-                      disabled={deletingId === resume.id}
+                      disabled={deletingId === resume.id || processingId === resume.id}
                     >
                       <Download className="size-4" />
                     </Button>
@@ -621,7 +672,7 @@ export function ResumePage() {
                       title="Delete resume"
                       aria-label={`Delete ${resume.file_name}`}
                       onClick={() => void handleDelete(resume.id)}
-                      disabled={deletingId === resume.id}
+                      disabled={deletingId === resume.id || processingId === resume.id}
                     >
                       <Trash2 className="size-4 text-destructive" />
                     </Button>
