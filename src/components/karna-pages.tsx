@@ -55,14 +55,19 @@ import {
 import { mockServices, interviewQuestion } from "@/lib/mock-data";
 import { toast } from "sonner";
 import { useAuth } from "@/auth/auth-provider";
+import { useUserIdentity } from "@/hooks/use-user-identity";
 import {
   addUserSkill,
   deleteUserSkill,
+  DuplicateSkillError,
   ensureProfile,
+  experienceLevelOptions,
   getProfile,
   getUserSkills,
+  normalizeExperienceLevel,
   saveProfile,
   type Profile,
+  type ProfileInput,
   type UserSkill,
 } from "@/lib/profile-service";
 import { supabase } from "@/lib/supabase";
@@ -369,8 +374,16 @@ export function RegisterPage() {
 }
 
 export function DashboardPage() {
+  const identity = useUserIdentity();
   return (
-    <AppShell title="Dashboard" eyebrow="Good morning, Alex">
+    <AppShell
+      title="Dashboard"
+      eyebrow={
+        identity.isLoading || !identity.displayName
+          ? "Career intelligence"
+          : `Good morning, ${identity.displayName}`
+      }
+    >
       <div className="animate-rise">
         <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
           <div>
@@ -1284,6 +1297,7 @@ function FieldInput({ label, value }: { label: string; value: string }) {
 }
 
 export function SettingsPage() {
+  const identity = useUserIdentity();
   const [theme, setTheme] = useState("light");
   const [saved, setSaved] = useState(false);
   return (
@@ -1292,11 +1306,17 @@ export function SettingsPage() {
         <SettingSection
           icon={UserRound}
           title="Account"
-          detail="Manage the details attached to this demo workspace"
+          detail="Manage the details attached to your workspace"
         >
           <div className="grid gap-4 sm:grid-cols-2">
-            <FieldInput label="Display name" value={demoProfile.name} />
-            <FieldInput label="Email" value={demoProfile.email} />
+            <div>
+              <label className="mb-1.5 block text-sm font-medium">Display name</label>
+              <Input value={identity.displayName} readOnly disabled={identity.isLoading} />
+            </div>
+            <div>
+              <label className="mb-1.5 block text-sm font-medium">Email</label>
+              <Input type="email" value={identity.email} readOnly disabled={identity.isLoading} />
+            </div>
           </div>
         </SettingSection>
         <SettingSection
@@ -1340,7 +1360,7 @@ export function SettingsPage() {
         <SettingSection
           icon={ShieldCheck}
           title="Privacy"
-          detail="Understand how your demo data is handled"
+          detail="Understand how your data is handled"
         >
           <div className="flex items-start gap-3 rounded-lg border border-info/20 bg-info/5 p-4">
             <ShieldCheck className="mt-0.5 size-4 shrink-0 text-info" />
@@ -1584,7 +1604,7 @@ export function SupabaseRegisterPage() {
   return <SupabaseAuthPage mode="register" />;
 }
 
-const emptyProfile: Omit<Profile, "id"> = {
+const emptyProfile: ProfileInput = {
   full_name: "",
   email: "",
   phone: "",
@@ -1597,11 +1617,13 @@ const emptyProfile: Omit<Profile, "id"> = {
 };
 export function SupabaseProfilePage() {
   const { user, signOut } = useAuth();
-  const [profile, setProfile] = useState<Omit<Profile, "id">>(emptyProfile);
+  const [profile, setProfile] = useState<ProfileInput>(emptyProfile);
   const [skillList, setSkillList] = useState<UserSkill[]>([]);
   const [newSkill, setNewSkill] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [addingSkill, setAddingSkill] = useState(false);
+  const [deletingSkillId, setDeletingSkillId] = useState<string | null>(null);
   const load = useCallback(async () => {
     if (!user) return;
     setLoading(true);
@@ -1609,11 +1631,20 @@ export function SupabaseProfilePage() {
       await ensureProfile(user);
       const [storedProfile, storedSkills] = await Promise.all([
         getProfile(user.id),
-        getUserSkills(user.id),
+        getUserSkills(user),
       ]);
       if (storedProfile) {
-        const { id: _id, ...storedValues } = storedProfile;
-        setProfile(storedValues);
+        const {
+          id: _id,
+          created_at: _createdAt,
+          updated_at: _updatedAt,
+          ...storedValues
+        } = storedProfile;
+        setProfile({
+          ...storedValues,
+          email: user.email ?? "",
+          experience_level: normalizeExperienceLevel(storedValues.experience_level) ?? "",
+        });
       } else {
         setProfile({
           ...emptyProfile,
@@ -1634,7 +1665,7 @@ export function SupabaseProfilePage() {
   useEffect(() => {
     void load();
   }, [load]);
-  const update = (key: keyof Omit<Profile, "id">, value: string) =>
+  const update = (key: Exclude<keyof ProfileInput, "email">, value: string) =>
     setProfile((current) => ({
       ...current,
       [key]: key === "graduation_year" ? (value ? Number(value) : null) : value,
@@ -1643,7 +1674,7 @@ export function SupabaseProfilePage() {
     if (!user) return;
     setSaving(true);
     try {
-      await saveProfile(user.id, profile);
+      await saveProfile(user, profile);
       toast.success("Profile saved.");
     } catch {
       toast.error("We couldn’t save your profile. Please try again.");
@@ -1661,21 +1692,50 @@ export function SupabaseProfilePage() {
   };
   const add = async () => {
     const skillName = newSkill.trim();
-    if (!user || !skillName) return;
+    if (!user) return;
+    if (!skillName) {
+      toast.error("Enter a skill name.");
+      return;
+    }
+    if (
+      skillList.some(
+        (skill) => skill.skill_name.toLocaleLowerCase() === skillName.toLocaleLowerCase(),
+      )
+    ) {
+      toast.error("This skill is already in your profile.");
+      return;
+    }
+    setAddingSkill(true);
     try {
-      await addUserSkill(user.id, skillName);
+      const addedSkill = await addUserSkill(user, skillName);
       setNewSkill("");
-      await load();
-    } catch {
-      toast.error("We couldn’t add that skill.");
+      setSkillList((current) => [...current, addedSkill]);
+      toast.success("Skill added.");
+    } catch (error) {
+      toast.error(
+        error instanceof DuplicateSkillError
+          ? "This skill is already in your profile."
+          : "We couldn’t add that skill. Please try again.",
+      );
+    } finally {
+      setAddingSkill(false);
     }
   };
   const remove = async (id: string) => {
+    if (!user) return;
+    setDeletingSkillId(id);
     try {
-      await deleteUserSkill(id);
+      await deleteUserSkill(user, id);
       setSkillList((current) => current.filter((skill) => skill.id !== id));
-    } catch {
-      toast.error("We couldn’t remove that skill.");
+      toast.success("Skill removed.");
+    } catch (error) {
+      toast.error(
+        error instanceof Error && error.message === "This skill is no longer available."
+          ? error.message
+          : "We couldn’t remove that skill. Please try again.",
+      );
+    } finally {
+      setDeletingSkillId(null);
     }
   };
   if (loading)
@@ -1684,16 +1744,17 @@ export function SupabaseProfilePage() {
         <p className="text-sm text-muted-foreground">Loading your profile…</p>
       </AppShell>
     );
-  const fields: [string, keyof Omit<Profile, "id">, string][] = [
+  const personalFields: [string, Exclude<keyof ProfileInput, "email">, string][] = [
     ["Name", "full_name", "text"],
-    ["Email", "email", "email"],
     ["Phone", "phone", "tel"],
     ["Location", "preferred_location", "text"],
+  ];
+  const educationFields: [string, Exclude<keyof ProfileInput, "email">, string][] = [
     ["Degree", "degree", "text"],
     ["Branch", "branch", "text"],
     ["Graduation year", "graduation_year", "number"],
     ["Target role", "target_role", "text"],
-    ["Experience level", "experience_level", "text"],
+    ["Experience level", "experience_level", "select"],
   ];
   return (
     <AppShell title="Profile" eyebrow="Your career identity">
@@ -1704,7 +1765,7 @@ export function SupabaseProfilePage() {
             detail="Keep your profile ready for analysis"
           />
           <div className="mt-6 grid gap-4 sm:grid-cols-2">
-            {fields.map(([label, key, type]) => (
+            {personalFields.map(([label, key, type]) => (
               <div key={key}>
                 <label className="mb-1.5 block text-sm font-medium">{label}</label>
                 <Input
@@ -1714,6 +1775,40 @@ export function SupabaseProfilePage() {
                 />
               </div>
             ))}
+            <div>
+              <label className="mb-1.5 block text-sm font-medium">Email</label>
+              <Input type="email" value={profile.email ?? ""} disabled readOnly />
+            </div>
+          </div>
+          <div className="mt-8 border-t border-line pt-6">
+            <SectionHeader title="Education & preferences" />
+            <div className="mt-5 grid gap-4 sm:grid-cols-2">
+              {educationFields.map(([label, key, type]) => (
+                <div key={key}>
+                  <label className="mb-1.5 block text-sm font-medium">{label}</label>
+                  {key === "experience_level" ? (
+                    <select
+                      value={profile.experience_level ?? ""}
+                      onChange={(event) => update(key, event.target.value)}
+                      className="flex h-10 w-full rounded-md border border-input bg-card px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    >
+                      <option value="">Select experience level</option>
+                      {experienceLevelOptions.map((option) => (
+                        <option key={option} value={option}>
+                          {option}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <Input
+                      type={type}
+                      value={profile[key] ?? ""}
+                      onChange={(event) => update(key, event.target.value)}
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
           <div className="mt-8 flex items-center gap-3">
             <Button
@@ -1742,6 +1837,7 @@ export function SupabaseProfilePage() {
                 <button
                   type="button"
                   aria-label={`Remove ${skill.skill_name}`}
+                  disabled={deletingSkillId === skill.id}
                   onClick={() => void remove(skill.id)}
                 >
                   <X className="size-3 text-muted-foreground" />
@@ -1754,6 +1850,7 @@ export function SupabaseProfilePage() {
               value={newSkill}
               onChange={(event) => setNewSkill(event.target.value)}
               placeholder="Add a skill"
+              disabled={addingSkill}
               onKeyDown={(event) => {
                 if (event.key === "Enter") {
                   event.preventDefault();
@@ -1761,7 +1858,13 @@ export function SupabaseProfilePage() {
                 }
               }}
             />
-            <Button variant="outline" size="icon" aria-label="Add skill" onClick={() => void add()}>
+            <Button
+              variant="outline"
+              size="icon"
+              aria-label="Add skill"
+              disabled={addingSkill}
+              onClick={() => void add()}
+            >
               <Plus />
             </Button>
           </div>
@@ -1776,7 +1879,7 @@ export function SupabaseSkillsPage() {
   const [loading, setLoading] = useState(true);
   useEffect(() => {
     if (!user) return;
-    void getUserSkills(user.id)
+    void getUserSkills(user)
       .then(setSkillList)
       .catch(() => toast.error("We couldn’t load your skills."))
       .finally(() => setLoading(false));
