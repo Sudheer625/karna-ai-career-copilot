@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { Link, useRouterState } from "@tanstack/react-router";
 import {
   BarChart3,
@@ -503,15 +503,16 @@ export function QuickAction({
   );
 }
 
-export function UploadPanel({ onUploaded }: { onUploaded: () => void }) {
-  const [loading, setLoading] = useState(false);
-  const handle = () => {
-    setLoading(true);
-    window.setTimeout(() => {
-      setLoading(false);
-      onUploaded();
-    }, 900);
-  };
+export function UploadPanel({
+  loading,
+  error,
+  onFileSelected,
+}: {
+  loading: boolean;
+  error: string | null;
+  onFileSelected: (file: File) => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
   return (
     <div className="app-surface rounded-2xl bg-card/75 p-6 sm:p-10">
       <div className="flex min-h-64 flex-col items-center justify-center rounded-xl border border-dashed border-brand/35 bg-brand/[0.03] px-5 text-center">
@@ -519,21 +520,37 @@ export function UploadPanel({ onUploaded }: { onUploaded: () => void }) {
           {loading ? <Sparkles className="animate-signal" /> : <Upload />}
         </div>
         <h2 className="mt-5 font-display text-xl font-semibold">
-          {loading ? "Analyzing your resume…" : "Upload your resume"}
+          {loading ? "Uploading your resume…" : "Upload your resume"}
         </h2>
         <p className="mt-2 max-w-sm text-sm text-muted-foreground">
           {loading
-            ? "Extracting content, mapping skills, and generating insights."
+            ? "Saving your PDF securely to your private resume storage."
             : "Upload a PDF to see your profile strengths, coverage, and next improvements."}
         </p>
+        <input
+          ref={inputRef}
+          type="file"
+          accept="application/pdf,.pdf"
+          className="hidden"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            event.target.value = "";
+            if (file) onFileSelected(file);
+          }}
+        />
         <Button
           className="mt-6 rounded-lg bg-brand text-primary-foreground hover:bg-brand-deep"
-          onClick={handle}
+          onClick={() => inputRef.current?.click()}
           disabled={loading}
         >
-          {loading ? "Processing" : "Choose Resume"}
+          {loading ? "Uploading" : "Choose Resume"}
         </Button>
-        <p className="mt-3 text-[11px] text-muted-foreground">PDF · Demo upload only · Max 10 MB</p>
+        <p className="mt-3 text-[11px] text-muted-foreground">PDF · Max 10 MB</p>
+        {error && (
+          <p className="mt-3 text-sm text-destructive" role="alert">
+            {error}
+          </p>
+        )}
       </div>
     </div>
   );

@@ -11,6 +11,7 @@ import {
   CircleCheck,
   Clock3,
   Code2,
+  Download,
   FileCheck2,
   FileText,
   Flag,
@@ -26,6 +27,7 @@ import {
   ShieldCheck,
   Sparkles,
   Target,
+  Trash2,
   Trophy,
   Upload,
   UserRound,
@@ -71,6 +73,13 @@ import {
   type UserSkill,
 } from "@/lib/profile-service";
 import { supabase } from "@/lib/supabase";
+import {
+  deleteResume,
+  getResumeDownloadUrl,
+  listUserResumes,
+  uploadResume,
+  type Resume,
+} from "@/lib/resume-service";
 
 const landingFeatures: [string, string, LucideIcon][] = [
   [
@@ -497,104 +506,156 @@ export function DashboardPage() {
   );
 }
 
+function formatFileSize(fileSize: number): string {
+  if (fileSize < 1024 * 1024) return `${Math.max(1, Math.round(fileSize / 1024))} KB`;
+  return `${(fileSize / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export function ResumePage() {
-  const [analyzed, setAnalyzed] = useState(false);
+  const { user, isLoading: authLoading } = useAuth();
+  const [resumes, setResumes] = useState<Resume[]>([]);
+  const [listLoading, setListLoading] = useState(true);
+  const [uploadLoading, setUploadLoading] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const loadResumes = useCallback(async () => {
+    if (!user) {
+      setResumes([]);
+      setListLoading(false);
+      return;
+    }
+    setListLoading(true);
+    try {
+      setResumes(await listUserResumes());
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "We could not load your resumes.");
+    } finally {
+      setListLoading(false);
+    }
+  }, [user]);
+  useEffect(() => {
+    void loadResumes();
+  }, [loadResumes]);
+
+  const handleUpload = async (file: File) => {
+    setError(null);
+    setUploadLoading(true);
+    try {
+      await uploadResume(file);
+      await loadResumes();
+      toast.success("Resume uploaded.");
+    } catch (uploadError) {
+      setError(uploadError instanceof Error ? uploadError.message : "We could not upload your resume.");
+    } finally {
+      setUploadLoading(false);
+    }
+  };
+
+  const handleDelete = async (resumeId: string) => {
+    setError(null);
+    setDeletingId(resumeId);
+    try {
+      await deleteResume(resumeId);
+      setResumes((current) => current.filter((resume) => resume.id !== resumeId));
+      toast.success("Resume deleted.");
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : "We could not delete your resume.");
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const handleDownload = async (resumeId: string) => {
+    setError(null);
+    try {
+      const url = await getResumeDownloadUrl(resumeId);
+      window.open(url, "_blank", "noopener,noreferrer");
+    } catch (downloadError) {
+      setError(downloadError instanceof Error ? downloadError.message : "We could not open your resume.");
+    }
+  };
+
+  const latestResume = resumes[0];
   return (
     <AppShell title="Resume Analyzer" eyebrow="Profile intelligence">
       <div className="grid gap-6 xl:grid-cols-[0.8fr_1.2fr]">
-        {!analyzed ? (
-          <UploadPanel onUploaded={() => setAnalyzed(true)} />
-        ) : (
-          <div className="app-surface rounded-2xl bg-card/75 p-6">
-            <div className="flex items-center gap-3">
-              <div className="grid size-10 place-items-center rounded-lg bg-success/10 text-success">
-                <CircleCheck className="size-5" />
-              </div>
-              <div>
-                <p className="font-display font-semibold">Analysis complete</p>
-                <p className="text-xs text-muted-foreground">resume_alex_kumar.pdf · Demo result</p>
-              </div>
-            </div>
-            <div className="mt-7 grid grid-cols-2 gap-3">
-              <MetricCard
-                label="Skill coverage"
-                value="82%"
-                detail="14 skills found"
-                icon={BarChart3}
-                tone="signal"
-              />
-              <MetricCard
-                label="Keyword coverage"
-                value="74%"
-                detail="Role-aligned language"
-                icon={FileCheck2}
-                tone="brand"
-              />
-            </div>
-            <div className="mt-6 rounded-xl border border-line bg-paper/60 p-4">
-              <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-                Resume indicators
+        <div className="space-y-6">
+          <UploadPanel loading={uploadLoading} error={error} onFileSelected={handleUpload} />
+          <section className="app-surface rounded-xl bg-card/70 p-5">
+            <SectionHeader title="Uploaded resumes" detail="Private files stored in your account" />
+            {authLoading || listLoading ? (
+              <p className="mt-5 text-sm text-muted-foreground" aria-busy="true">
+                Loading resumes…
               </p>
-              <div className="mt-4 space-y-4">
-                <ProgressRow name="Project relevance" value={78} />
-                <ProgressRow name="Experience alignment" value={66} />
+            ) : !user ? (
+              <p className="mt-5 text-sm text-muted-foreground">Sign in to manage your resumes.</p>
+            ) : resumes.length === 0 ? (
+              <p className="mt-5 text-sm text-muted-foreground">No resumes uploaded yet.</p>
+            ) : (
+              <div className="mt-5 space-y-3">
+                {resumes.map((resume) => (
+                  <div
+                    key={resume.id}
+                    className="flex items-center gap-3 rounded-lg border border-line bg-paper/40 p-3"
+                  >
+                    <FileText className="size-5 shrink-0 text-brand" />
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-medium">{resume.file_name}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {formatFileSize(resume.file_size)} · {resume.status}
+                      </p>
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      title="View resume"
+                      aria-label={`View ${resume.file_name}`}
+                      onClick={() => void handleDownload(resume.id)}
+                      disabled={deletingId === resume.id}
+                    >
+                      <Download className="size-4" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      title="Delete resume"
+                      aria-label={`Delete ${resume.file_name}`}
+                      onClick={() => void handleDelete(resume.id)}
+                      disabled={deletingId === resume.id}
+                    >
+                      <Trash2 className="size-4 text-destructive" />
+                    </Button>
+                  </div>
+                ))}
               </div>
-            </div>
-            <Button
-              variant="outline"
-              className="mt-6 rounded-lg"
-              onClick={() => setAnalyzed(false)}
-            >
-              Analyze another resume
-            </Button>
-          </div>
-        )}
+            )}
+          </section>
+        </div>
         <div className="space-y-6">
           <section className="app-surface rounded-xl bg-card/70 p-5">
             <SectionHeader
               title="What we found"
-              detail="AI-generated insights for this demo profile"
+              detail="AI analysis will be added in a later phase"
             />
-            {analyzed ? (
-              <div className="mt-5 grid gap-5 sm:grid-cols-2">
-                <InsightList
-                  title="Strengths"
-                  icon={CircleCheck}
-                  tone="success"
-                  items={[
-                    "Strong Python foundation",
-                    "Relevant ML projects",
-                    "Good technical skill coverage",
-                  ]}
-                />
-                <InsightList
-                  title="Areas to improve"
-                  icon={Lightbulb}
-                  tone="warning"
-                  items={[
-                    "Add measurable project outcomes",
-                    "Improve keyword alignment",
-                    "Add deployment experience",
-                  ]}
-                />
-              </div>
-            ) : (
-              <EmptyState
-                icon={FileText}
-                title="Your resume insights will appear here"
-                detail="Upload a PDF to extract education, projects, skills, and improvement areas."
-              />
-            )}
+            <EmptyState
+              icon={FileText}
+              title={latestResume ? "Resume uploaded successfully" : "Your resume insights will appear here"}
+              detail={
+                latestResume
+                  ? "Your file is ready for analysis when the AI resume workflow is implemented."
+                  : "Upload a PDF to prepare it for future resume analysis."
+              }
+            />
           </section>
           <section className="app-surface rounded-xl bg-card/70 p-5">
             <SectionHeader title="Resume overview" detail="Structured profile details" />
-            {analyzed ? (
+            {latestResume ? (
               <div className="mt-5 grid gap-4 sm:grid-cols-2">
                 {[
-                  ["Education", "B.Tech Computer Science · 2026"],
-                  ["Experience", "Fresher · Placement preparation"],
-                  ["Projects", "3 projects detected"],
-                  ["Certifications", "2 certifications detected"],
+                  ["File name", latestResume.file_name],
+                  ["File type", latestResume.mime_type],
+                  ["File size", formatFileSize(latestResume.file_size)],
+                  ["Uploaded", new Date(latestResume.created_at).toLocaleString()],
                 ].map(([label, value]) => (
                   <div key={label} className="rounded-lg border border-line bg-paper/40 p-4">
                     <p className="text-xs text-muted-foreground">{label}</p>
@@ -603,9 +664,7 @@ export function ResumePage() {
                 ))}
               </div>
             ) : (
-              <div className="rounded-lg border border-dashed border-line p-6 text-center text-sm text-muted-foreground">
-                Upload to generate a structured overview.
-              </div>
+              <EmptyState icon={FileText} title="No resume uploaded" detail="Upload a PDF to see its stored details here." />
             )}
           </section>
         </div>
