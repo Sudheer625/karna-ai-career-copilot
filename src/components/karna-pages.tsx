@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import {
   type LucideIcon,
@@ -74,11 +74,14 @@ import {
 } from "@/lib/profile-service";
 import { supabase } from "@/lib/supabase";
 import {
+  analyzeUserResume,
   deleteResume,
   getResumeDownloadUrl,
   listUserResumes,
+  listUserResumeAnalyses,
   processUserResume,
   uploadResume,
+  type ResumeAnalysisRecord,
   type Resume,
 } from "@/lib/resume-service";
 
@@ -523,6 +526,8 @@ export function ResumePage() {
   const [uploadLoading, setUploadLoading] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [processingId, setProcessingId] = useState<string | null>(null);
+  const [analysisByResume, setAnalysisByResume] = useState<Record<string, ResumeAnalysisRecord>>({});
+  const [analyzingId, setAnalyzingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const loadResumes = useCallback(async () => {
     if (!user) {
@@ -532,7 +537,17 @@ export function ResumePage() {
     }
     setListLoading(true);
     try {
-      setResumes(await listUserResumes());
+      const [nextResumes, nextAnalyses] = await Promise.all([
+        listUserResumes(),
+        listUserResumeAnalyses(),
+      ]);
+      setResumes(nextResumes);
+      setAnalysisByResume(
+        nextAnalyses.reduce<Record<string, ResumeAnalysisRecord>>((latest, analysis) => {
+          if (!latest[analysis.resume_id]) latest[analysis.resume_id] = analysis;
+          return latest;
+        }, {}),
+      );
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "We could not load your resumes.");
     } finally {
@@ -601,7 +616,37 @@ export function ResumePage() {
     }
   };
 
+  const handleAnalyze = async (resumeId: string, regenerate = false) => {
+    setError(null);
+    setAnalyzingId(resumeId);
+    setAnalysisByResume((current) => ({
+      ...current,
+      [resumeId]: {
+        ...current[resumeId],
+        status: "processing",
+        resume_id: resumeId,
+      } as ResumeAnalysisRecord,
+    }));
+    try {
+      const analysis = await analyzeUserResume(resumeId, regenerate);
+      setAnalysisByResume((current) => ({ ...current, [resumeId]: analysis }));
+      toast.success("AI resume analysis completed.");
+    } catch (analysisError) {
+      const analyses = await listUserResumeAnalyses().catch(() => []);
+      const latest = analyses.find((analysis) => analysis.resume_id === resumeId);
+      if (latest) setAnalysisByResume((current) => ({ ...current, [resumeId]: latest }));
+      setError(
+        analysisError instanceof Error
+          ? analysisError.message
+          : "We could not generate resume analysis.",
+      );
+    } finally {
+      setAnalyzingId(null);
+    }
+  };
+
   const latestResume = resumes[0];
+  const latestAnalysis = latestResume ? analysisByResume[latestResume.id] : undefined;
   return (
     <AppShell title="Resume Analyzer" eyebrow="Profile intelligence">
       <div className="grid gap-6 xl:grid-cols-[0.8fr_1.2fr]">
@@ -641,6 +686,16 @@ export function ResumePage() {
                       {resume.status === "failed" && resume.processing_error && (
                         <p className="mt-1 text-xs text-destructive">{resume.processing_error}</p>
                       )}
+                      {analysisByResume[resume.id]?.status === "failed" && (
+                        <p className="mt-1 text-xs text-destructive">
+                          {analysisByResume[resume.id]?.error_message &&
+                          !/^(ENV_MISSING|AUTH_MISSING|RESUME_NOT_FOUND|RESUME_NOT_PROCESSED|EXTRACTED_TEXT_MISSING|GEMINI_INITIALIZATION_FAILED|GEMINI_REQUEST_FAILED|GEMINI_SCHEMA_ERROR|GEMINI_RESPONSE_INVALID|SUPABASE_SAVE_FAILED|UNKNOWN_SERVER_ERROR)$/.test(
+                            analysisByResume[resume.id]?.error_message ?? "",
+                          )
+                            ? analysisByResume[resume.id]?.error_message
+                            : "AI analysis failed."}
+                        </p>
+                      )}
                     </div>
                     {(resume.status === "uploaded" ||
                       resume.status === "failed" ||
@@ -654,6 +709,28 @@ export function ResumePage() {
                         {resume.status === "processing" || processingId === resume.id
                           ? "Processing"
                           : "Process Resume"}
+                      </Button>
+                    )}
+                    {resume.status === "processed" && (
+                      <Button
+                        variant="outline"
+                        className="h-8 shrink-0 rounded-lg px-2 text-xs"
+                        onClick={() =>
+                          void handleAnalyze(
+                            resume.id,
+                            analysisByResume[resume.id]?.status === "completed",
+                          )
+                        }
+                        disabled={
+                          analyzingId === resume.id ||
+                          analysisByResume[resume.id]?.status === "processing"
+                        }
+                      >
+                        {analyzingId === resume.id || analysisByResume[resume.id]?.status === "processing"
+                          ? "Analyzing"
+                          : analysisByResume[resume.id]?.status === "completed"
+                            ? "Regenerate AI Analysis"
+                            : "Analyze with AI"}
                       </Button>
                     )}
                     <Button
@@ -686,17 +763,46 @@ export function ResumePage() {
           <section className="app-surface rounded-xl bg-card/70 p-5">
             <SectionHeader
               title="What we found"
-              detail="AI analysis will be added in a later phase"
+              detail="Gemini-powered resume intelligence"
             />
-            <EmptyState
-              icon={FileText}
-              title={latestResume ? "Resume uploaded successfully" : "Your resume insights will appear here"}
-              detail={
-                latestResume
-                  ? "Your file is ready for analysis when the AI resume workflow is implemented."
-                  : "Upload a PDF to prepare it for future resume analysis."
-              }
-            />
+            {latestAnalysis?.status === "completed" ? (
+              <ResumeAnalysisDetails analysis={latestAnalysis.analysis} />
+            ) : latestAnalysis?.status === "failed" ? (
+              <EmptyState
+                icon={FileText}
+                title="AI analysis failed"
+                detail={
+                  latestAnalysis.error_message &&
+                  !/^(ENV_MISSING|AUTH_MISSING|RESUME_NOT_FOUND|RESUME_NOT_PROCESSED|EXTRACTED_TEXT_MISSING|GEMINI_INITIALIZATION_FAILED|GEMINI_REQUEST_FAILED|GEMINI_SCHEMA_ERROR|GEMINI_RESPONSE_INVALID|SUPABASE_SAVE_FAILED|UNKNOWN_SERVER_ERROR)$/.test(
+                    latestAnalysis.error_message,
+                  )
+                    ? latestAnalysis.error_message
+                    : "We could not generate resume analysis. Please try again."
+                }
+                action={
+                  latestResume && (
+                    <Button
+                      variant="outline"
+                      className="rounded-lg"
+                      onClick={() => void handleAnalyze(latestResume.id)}
+                      disabled={analyzingId === latestResume.id}
+                    >
+                      {analyzingId === latestResume.id ? "Analyzing" : "Retry"}
+                    </Button>
+                  )
+                }
+              />
+            ) : (
+              <EmptyState
+                icon={FileText}
+                title={latestResume ? "AI analysis not generated yet." : "Your resume insights will appear here"}
+                detail={
+                  latestResume
+                    ? "Process your resume, then choose Analyze with AI to generate structured insights."
+                    : "Upload a PDF to prepare it for future resume analysis."
+                }
+              />
+            )}
           </section>
           <section className="app-surface rounded-xl bg-card/70 p-5">
             <SectionHeader title="Resume overview" detail="Structured profile details" />
@@ -751,6 +857,92 @@ function InsightList({
       </ul>
     </div>
   );
+}
+
+function ResumeAnalysisDetails({ analysis }: { analysis: ResumeAnalysisRecord["analysis"] }) {
+  return (
+    <div className="mt-5 space-y-5">
+      <div className="rounded-lg border border-line bg-paper/40 p-4">
+        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+          Resume Summary
+        </p>
+        <p className="mt-2 text-sm leading-relaxed">{analysis.summary || "No summary was identified."}</p>
+      </div>
+      <AnalysisGroup title="Skills">
+        {analysis.skills.map((skill) => (
+          <AnalysisItem key={`${skill.name}-${skill.category}`}>
+            <span className="font-medium">{skill.name}</span>
+            <span className="text-muted-foreground">
+              {skill.category} · {skill.proficiency}
+            </span>
+          </AnalysisItem>
+        ))}
+      </AnalysisGroup>
+      <AnalysisGroup title="Education">
+        {analysis.education.map((item) => (
+          <AnalysisItem key={`${item.degree}-${item.institution}-${item.year}`}>
+            {item.degree} · {item.institution} · {item.year}
+          </AnalysisItem>
+        ))}
+      </AnalysisGroup>
+      <AnalysisGroup title="Experience">
+        {analysis.experience.map((item) => (
+          <AnalysisItem key={`${item.role}-${item.company}-${item.duration}`}>
+            <span className="font-medium">{item.role} · {item.company}</span>
+            <span className="text-muted-foreground">{item.duration}</span>
+            {item.highlights.length > 0 && <span className="text-muted-foreground">{item.highlights.join(" · ")}</span>}
+          </AnalysisItem>
+        ))}
+      </AnalysisGroup>
+      <AnalysisGroup title="Projects">
+        {analysis.projects.map((item) => (
+          <AnalysisItem key={item.name}>
+            <span className="font-medium">{item.name}</span>
+            <span className="text-muted-foreground">{item.description}</span>
+            {item.technologies.length > 0 && (
+              <span className="text-muted-foreground">{item.technologies.join(" · ")}</span>
+            )}
+          </AnalysisItem>
+        ))}
+      </AnalysisGroup>
+      <AnalysisGroup title="Certifications">
+        {analysis.certifications.map((item) => (
+          <AnalysisItem key={`${item.name}-${item.issuer}`}>
+            {item.name} · {item.issuer}
+          </AnalysisItem>
+        ))}
+      </AnalysisGroup>
+      <AnalysisGroup title="Recommended Roles">
+        {analysis.recommended_roles.map((role) => (
+          <AnalysisItem key={role}>{role}</AnalysisItem>
+        ))}
+      </AnalysisGroup>
+      <AnalysisGroup title="Missing Skills">
+        {analysis.missing_skills.map((skill) => (
+          <AnalysisItem key={skill}>{skill}</AnalysisItem>
+        ))}
+      </AnalysisGroup>
+    </div>
+  );
+}
+
+function AnalysisGroup({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div>
+      <p className="text-sm font-semibold">{title}</p>
+      {children ? (
+        <div className="mt-2 space-y-2 rounded-lg border border-line bg-paper/40 p-3 text-sm">
+          {children}
+        </div>
+      ) : (
+        <p className="mt-2 text-sm text-muted-foreground">No information identified.</p>
+      )}
+    </div>
+  );
+}
+
+function AnalysisItem({ children }: { children: ReactNode }) {
+  return <div className="flex flex-col gap-0.5">{children}</div>;
 }
 
 export function JobsPage() {

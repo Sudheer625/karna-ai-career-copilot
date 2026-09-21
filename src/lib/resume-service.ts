@@ -1,6 +1,13 @@
 import type { User } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabase";
 import { processResume } from "@/lib/resume-processing";
+import {
+  analyzeResume,
+  getResumeAnalysis,
+  type ResumeAnalysisRecord,
+} from "@/lib/gemini-resume-analysis";
+
+export type { ResumeAnalysis, ResumeAnalysisRecord } from "@/lib/gemini-resume-analysis";
 
 const RESUME_BUCKET = "resumes";
 export const MAX_RESUME_FILE_SIZE = 10 * 1024 * 1024;
@@ -174,4 +181,36 @@ export async function processUserResume(resumeId: string): Promise<void> {
     data: { resumeId },
     headers: { Authorization: `Bearer ${sessionData.session.access_token}` },
   });
+}
+
+export async function analyzeUserResume(resumeId: string, regenerate = false): Promise<ResumeAnalysisRecord> {
+  const { data: sessionData, error } = await supabase.auth.getSession();
+  if (error || !sessionData.session) throw new Error("Please sign in before analyzing a resume.");
+  return analyzeResume({
+    data: { resumeId, regenerate },
+    headers: { Authorization: `Bearer ${sessionData.session.access_token}` },
+  });
+}
+
+export async function getUserResumeAnalysis(resumeId: string): Promise<ResumeAnalysisRecord | null> {
+  const { data: sessionData, error } = await supabase.auth.getSession();
+  if (error || !sessionData.session) throw new Error("Please sign in before loading analysis.");
+  return getResumeAnalysis({
+    data: { resumeId },
+    headers: { Authorization: `Bearer ${sessionData.session.access_token}` },
+  });
+}
+
+export async function listUserResumeAnalyses(): Promise<ResumeAnalysisRecord[]> {
+  const user = await getAuthenticatedUser();
+  const { data, error } = await supabase
+    .from("resume_analyses")
+    .select("id, resume_id, user_id, model, analysis, status, error_message, created_at, updated_at")
+    .eq("user_id", user.id)
+    .order("created_at", { ascending: false });
+  if (error) {
+    logResumeError("analysis-list", error);
+    throw new Error("We could not load your resume analyses. Please try again.");
+  }
+  return data as ResumeAnalysisRecord[];
 }
