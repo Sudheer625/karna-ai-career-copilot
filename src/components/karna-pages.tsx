@@ -74,11 +74,14 @@ import {
 import { supabase } from "@/lib/supabase";
 import {
   generateJobMatches,
+  getAvailableJobs,
   getLatestResumeAnalysis,
   getProcessedResumes,
   getUserJobMatches,
   type JobMatch,
 } from "@/lib/job-matching-service";
+import { calculateSkillGap, type SkillGapResult } from "@/lib/skill-gap";
+import { normalizeSkill } from "@/lib/job-matching";
 import {
   analyzeUserResume,
   deleteResume,
@@ -2222,42 +2225,177 @@ export function SupabaseProfilePage() {
   );
 }
 export function SupabaseSkillsPage() {
-  const { user } = useAuth();
-  const [skillList, setSkillList] = useState<UserSkill[]>([]);
+  const { user, isLoading: authLoading } = useAuth();
+  const [resumes, setResumes] = useState<Array<{ id: string; file_name: string; status: string }>>([]);
+  const [jobs, setJobs] = useState<Array<{ id: string; title: string; company: string; location: string; employment_type: string; required_skills: string[]; preferred_skills: string[] }>>([]);
+  const [selectedResumeId, setSelectedResumeId] = useState("");
+  const [selectedJobId, setSelectedJobId] = useState("");
+  const [analysisSkills, setAnalysisSkills] = useState<Array<{ name: string; category: string; proficiency: string }>>([]);
+  const [result, setResult] = useState<SkillGapResult | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    if (!user) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    try {
+      const [processedResumes, availableJobs] = await Promise.all([
+        getProcessedResumes(),
+        getAvailableJobs(),
+      ]);
+      setResumes(processedResumes);
+      setJobs(availableJobs);
+      const resumeId = selectedResumeId && processedResumes.some((resume) => resume.id === selectedResumeId)
+        ? selectedResumeId
+        : processedResumes[0]?.id ?? "";
+      const jobId = selectedJobId && availableJobs.some((job) => job.id === selectedJobId)
+        ? selectedJobId
+        : availableJobs[0]?.id ?? "";
+      setSelectedResumeId(resumeId);
+      setSelectedJobId(jobId);
+      if (resumeId) {
+        const analysis = await getLatestResumeAnalysis(resumeId);
+        const skills = analysis?.analysis.skills ?? [];
+        setAnalysisSkills(skills);
+        const job = availableJobs.find((item) => item.id === jobId);
+        setResult(job && analysis ? calculateSkillGap(skills, job) : null);
+      }
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "We could not load skill gap data.");
+    } finally {
+      setLoading(false);
+    }
+  }, [selectedJobId, selectedResumeId, user]);
+
   useEffect(() => {
-    if (!user) return;
-    void getUserSkills(user)
-      .then(setSkillList)
-      .catch(() => toast.error("We couldn’t load your skills."))
-      .finally(() => setLoading(false));
-  }, [user]);
+    void load();
+  }, [load]);
+
+  const updateSelection = async (resumeId: string, jobId: string) => {
+    setSelectedResumeId(resumeId);
+    setSelectedJobId(jobId);
+    setError(null);
+    try {
+      const analysis = await getLatestResumeAnalysis(resumeId);
+      const skills = analysis?.analysis.skills ?? [];
+      setAnalysisSkills(skills);
+      const job = jobs.find((item) => item.id === jobId);
+      setResult(job && analysis ? calculateSkillGap(skills, job) : null);
+    } catch (selectionError) {
+      setError(selectionError instanceof Error ? selectionError.message : "We could not load this selection.");
+    }
+  };
+
   return (
-    <AppShell title="Skill Gap Analyzer" eyebrow="Your saved skills">
-      {loading ? (
-        <p className="text-sm text-muted-foreground">Loading your skills…</p>
+    <AppShell title="Skill Gap Analysis" eyebrow="Resume skills compared with a target role">
+      {loading || authLoading ? (
+        <p className="text-sm text-muted-foreground" aria-busy="true">Loading skill gap data…</p>
+      ) : !user ? (
+        <p className="text-sm text-muted-foreground">Sign in to view skill gap insights.</p>
+      ) : resumes.length === 0 ? (
+        <EmptyState
+          icon={FileText}
+          title="Upload and process your resume first."
+          detail="A processed resume is required before skill gap analysis can run."
+          action={<Button asChild variant="outline" className="rounded-lg"><Link to="/resume">Go to Resume Analyzer</Link></Button>}
+        />
+      ) : jobs.length === 0 ? (
+        <EmptyState icon={Briefcase} title="No target jobs available" detail="Add jobs before viewing skill gap insights." />
       ) : (
-        <section className="app-surface rounded-xl bg-card/70 p-5">
-          <SectionHeader title="Your skill map" detail="Skills saved to your profile" />
-          <div className="mt-6 space-y-4">
-            {skillList.length ? (
-              skillList.map((skill) => (
-                <div
-                  key={skill.id}
-                  className="flex items-center justify-between rounded-lg border border-line bg-paper/40 p-4"
+        <div className="space-y-6">
+          <section className="app-surface rounded-xl bg-card/70 p-5">
+            <SectionHeader title="Choose your comparison" detail="No AI calls are made when changing selections" />
+            <div className="mt-5 grid gap-4 md:grid-cols-2">
+              <label className="text-sm font-medium">
+                Resume
+                <select
+                  value={selectedResumeId}
+                  onChange={(event) => void updateSelection(event.target.value, selectedJobId)}
+                  className="mt-1.5 h-10 w-full rounded-lg border border-line bg-card px-3 text-sm"
                 >
-                  <span className="text-sm font-medium">{skill.skill_name}</span>
-                  <StatusBadge status={skill.proficiency ?? "Developing"} />
-                </div>
-              ))
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                Add skills from your Profile to begin building your skill map.
-              </p>
-            )}
-          </div>
-        </section>
+                  {resumes.map((resume) => <option key={resume.id} value={resume.id}>{resume.file_name}</option>)}
+                </select>
+              </label>
+              <label className="text-sm font-medium">
+                Target job
+                <select
+                  value={selectedJobId}
+                  onChange={(event) => void updateSelection(selectedResumeId, event.target.value)}
+                  className="mt-1.5 h-10 w-full rounded-lg border border-line bg-card px-3 text-sm"
+                >
+                  {jobs.map((job) => <option key={job.id} value={job.id}>{job.title} · {job.company} · {job.location}</option>)}
+                </select>
+              </label>
+            </div>
+            {error && <p className="mt-4 text-sm text-destructive" role="alert">{error}</p>}
+          </section>
+          {!result ? (
+            <EmptyState
+              icon={FileText}
+              title="Analyze your resume first to generate skill gap insights."
+              detail="The selected resume does not have a completed resume analysis yet."
+              action={<Button asChild variant="outline" className="rounded-lg"><Link to="/resume">Analyze Resume</Link></Button>}
+            />
+          ) : (
+            <SkillGapDetails result={result} candidateSkills={analysisSkills} />
+          )}
+        </div>
       )}
     </AppShell>
+  );
+}
+
+function SkillGapDetails({
+  result,
+  candidateSkills,
+}: {
+  result: SkillGapResult;
+  candidateSkills: Array<{ name: string; proficiency: string }>;
+}) {
+  const proficiencyByName = new Map(candidateSkills.map((skill) => [normalizeSkill(skill.name), skill.proficiency]));
+  return (
+    <div className="grid gap-6 xl:grid-cols-[1.2fr_0.8fr]">
+      <section className="app-surface rounded-xl bg-card/70 p-5">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <p className="text-xs uppercase tracking-[0.14em] text-brand">Target role</p>
+            <h2 className="mt-2 font-display text-2xl font-semibold">{result.targetJob.title}</h2>
+            <p className="mt-1 text-sm text-muted-foreground">{result.targetJob.company} · {result.targetJob.location}</p>
+          </div>
+          <div className="rounded-xl bg-brand/10 px-4 py-3 text-center">
+            <p className="text-[10px] uppercase tracking-wider text-brand">Skill Coverage</p>
+            <p className="mt-1 font-display text-3xl font-semibold text-brand">{result.coveragePercentage}%</p>
+          </div>
+        </div>
+        <p className="mt-5 rounded-lg border border-line bg-paper/40 p-4 text-sm text-muted-foreground">
+          You currently match {result.matchedRequiredSkills.length} of {result.targetJob.required_skills.length} required skills for this role.
+        </p>
+        <div className="mt-6 grid gap-5 sm:grid-cols-2">
+          <SkillGroup title="Strong / Matched Skills" skills={result.matchedRequiredSkills.map((skill) => `${skill}${proficiencyByName.has(normalizeSkill(skill)) ? ` · ${proficiencyByName.get(normalizeSkill(skill))}` : ""}`)} tone="success" />
+          <SkillGroup title="Critical Skills to Develop" skills={result.missingRequiredSkills} tone="warning" />
+        </div>
+      </section>
+      <div className="space-y-6">
+        <section className="app-surface rounded-xl bg-card/70 p-5">
+          <SectionHeader title="Additional Skills That Could Strengthen Your Profile" />
+          <SkillGroup title="Preferred skill gaps" skills={result.missingPreferredSkills} tone="warning" />
+        </section>
+        <section className="app-surface rounded-xl bg-card/70 p-5">
+          <SectionHeader title="Priority" detail="Required gaps first, then preferred gaps" />
+          <div className="mt-4 space-y-2">
+            {result.prioritySkills.length ? result.prioritySkills.map((skill, index) => (
+              <div key={`${skill.priority}-${skill.name}`} className="flex items-center gap-3 rounded-lg border border-line bg-paper/40 p-3">
+                <span className="grid size-7 place-items-center rounded-full bg-warning/10 text-xs font-semibold text-warning">{index + 1}</span>
+                <span className="text-sm font-medium">{skill.name}</span>
+                <span className="ml-auto text-xs text-muted-foreground">Priority {skill.priority}</span>
+              </div>
+            )) : <p className="text-sm text-muted-foreground">No skill gaps identified.</p>}
+          </div>
+        </section>
+      </div>
+    </div>
   );
 }
