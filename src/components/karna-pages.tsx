@@ -81,6 +81,7 @@ import {
   type Job,
   type JobMatch,
 } from "@/lib/job-matching-service";
+import { generateCareerRoadmap, type CareerRoadmap } from "@/lib/career-roadmap";
 import { calculateSkillGap, type SkillGapResult } from "@/lib/skill-gap";
 import { normalizeSkill } from "@/lib/job-matching";
 import {
@@ -1260,80 +1261,316 @@ export function SkillsPage() {
 }
 
 export function RoadmapPage() {
+  const { user, isLoading: authLoading } = useAuth();
+  const [resumes, setResumes] = useState<Resume[]>([]);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [selectedResumeId, setSelectedResumeId] = useState("");
+  const [selectedJobId, setSelectedJobId] = useState("");
+  const [roadmapData, setRoadmapData] = useState<CareerRoadmap | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [generating, setGenerating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const safeErrorMessage = (message: string): string => {
+    if (message.includes("Please sign in")) return "Please sign in to generate a career roadmap.";
+    if (message.includes("resume")) return "Add and analyze a processed resume before generating a roadmap.";
+    if (message.includes("job")) return "Choose a target job to generate a roadmap.";
+    return "We could not generate this roadmap. Please try again.";
+  };
+
+  const loadStoredRoadmap = useCallback(async (resumeId: string, jobId: string) => {
+    if (!user || !resumeId || !jobId) {
+      setRoadmapData(null);
+      return;
+    }
+
+    const { data, error: roadmapError } = await supabase
+      .from("career_roadmaps")
+      .select("roadmap, status")
+      .eq("user_id", user.id)
+      .eq("resume_id", resumeId)
+      .eq("job_id", jobId)
+      .eq("status", "completed")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle<{ roadmap: CareerRoadmap; status: "completed" }>();
+
+    if (roadmapError) {
+      setRoadmapData(null);
+      return;
+    }
+
+    setRoadmapData(data?.roadmap ?? null);
+  }, [user]);
+
+  useEffect(() => {
+    if (!user) {
+      setResumes([]);
+      setJobs([]);
+      setSelectedResumeId("");
+      setSelectedJobId("");
+      setRoadmapData(null);
+      setLoading(false);
+      return;
+    }
+
+    const loadPageData = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const [processedResumes, availableJobs] = await Promise.all([
+          getProcessedResumes(),
+          getAvailableJobs(),
+        ]);
+
+        const { data: completedAnalyses } = await supabase
+          .from("resume_analyses")
+          .select("resume_id")
+          .eq("user_id", user.id)
+          .eq("status", "completed");
+
+        const usableResumeIds = new Set((completedAnalyses ?? []).map((analysis) => analysis.resume_id));
+        const usableResumes = processedResumes.filter((resume) => usableResumeIds.has(resume.id));
+
+        setResumes(usableResumes);
+        setJobs(availableJobs);
+
+        const nextResumeId = usableResumes.some((resume) => resume.id === selectedResumeId)
+          ? selectedResumeId
+          : usableResumes[0]?.id ?? "";
+        const nextJobId = availableJobs.some((job) => job.id === selectedJobId)
+          ? selectedJobId
+          : availableJobs[0]?.id ?? "";
+
+        setSelectedResumeId(nextResumeId);
+        setSelectedJobId(nextJobId);
+
+        if (nextResumeId && nextJobId) {
+          await loadStoredRoadmap(nextResumeId, nextJobId);
+        } else {
+          setRoadmapData(null);
+        }
+      } catch (loadError) {
+        setError(loadError instanceof Error ? loadError.message : "We could not load your roadmap data.");
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    void loadPageData();
+  }, [user]);
+
+  useEffect(() => {
+    if (!user || !selectedResumeId || !selectedJobId) {
+      setRoadmapData(null);
+      return;
+    }
+    void loadStoredRoadmap(selectedResumeId, selectedJobId);
+  }, [user, selectedResumeId, selectedJobId, loadStoredRoadmap]);
+
+  const handleGenerate = async () => {
+    if (!selectedResumeId || !selectedJobId) return;
+    setGenerating(true);
+    setError(null);
+    try {
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !sessionData.session) {
+        throw new Error("Please sign in before generating a career roadmap.");
+      }
+
+      const result = await generateCareerRoadmap({
+        data: { resumeId: selectedResumeId, jobId: selectedJobId, regenerate: false },
+        headers: { Authorization: `Bearer ${sessionData.session.access_token}` },
+      });
+
+      setRoadmapData(result.roadmap ?? null);
+    } catch (generationError) {
+      setRoadmapData(null);
+      const message = generationError instanceof Error ? generationError.message : "We could not generate this roadmap. Please try again.";
+      setError(safeErrorMessage(message));
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  const canGenerate = Boolean(selectedResumeId && selectedJobId) && !generating;
+
   return (
     <AppShell title="Career Roadmap" eyebrow="A phased plan for your target role">
-      <div className="app-surface rounded-xl bg-card/70 p-5 sm:p-7">
-        <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
-          <div>
-            <p className="text-xs uppercase tracking-[0.14em] text-brand">Career goal</p>
-            <h2 className="mt-2 font-display text-2xl font-semibold">{demoProfile.targetRole}</h2>
-            <p className="mt-1 text-sm text-muted-foreground">
-              A 12-week plan built around your current profile and skill gaps.
-            </p>
-          </div>
-          <div className="flex items-center gap-3">
-            <div className="text-right">
-              <p className="text-2xl font-display font-semibold">24%</p>
-              <p className="text-[10px] uppercase tracking-wider text-muted-foreground">complete</p>
+      <div className="grid gap-6 xl:grid-cols-[0.9fr_1.1fr]">
+        <section className="app-surface rounded-xl bg-card/70 p-5">
+          <SectionHeader
+            title="Build your roadmap"
+            detail="Choose your analyzed resume and target role to keep the plan tied to your data."
+          />
+
+          {authLoading || loading ? (
+            <p className="mt-6 text-sm text-muted-foreground" aria-busy="true">Loading roadmap data…</p>
+          ) : !user ? (
+            <p className="mt-6 text-sm text-muted-foreground">Please sign in to view your roadmap.</p>
+          ) : resumes.length === 0 ? (
+            <div className="mt-6">
+              <EmptyState
+                icon={FileText}
+                title="No processed resume ready"
+                detail="Analyze a processed resume before creating a roadmap."
+                action={<Button asChild variant="outline" className="rounded-lg"><Link to="/resume">Analyze Resume</Link></Button>}
+              />
             </div>
-            <div className="h-2 w-28 overflow-hidden rounded-full bg-ink/10">
-              <div className="h-full w-[24%] rounded-full bg-brand" />
+          ) : jobs.length === 0 ? (
+            <div className="mt-6">
+              <EmptyState
+                icon={Briefcase}
+                title="No target jobs available"
+                detail="There are no jobs available yet for this roadmap."
+              />
             </div>
-          </div>
-        </div>
-        <div className="mt-10 space-y-0">
-          {roadmap.map((item, index) => (
-            <div key={item.phase} className="relative flex gap-4 pb-8 last:pb-0">
-              <div className="relative flex w-9 shrink-0 justify-center">
-                <span
-                  className={
-                    item.status === "In progress"
-                      ? "z-10 grid size-9 place-items-center rounded-full bg-brand text-primary-foreground ring-4 ring-brand/10"
-                      : "z-10 grid size-9 place-items-center rounded-full border border-line bg-card text-muted-foreground"
-                  }
+          ) : (
+            <div className="mt-6 space-y-4">
+              <div>
+                <label htmlFor="roadmap-resume" className="mb-1.5 block text-sm font-medium">Resume</label>
+                <select
+                  id="roadmap-resume"
+                  value={selectedResumeId}
+                  onChange={(event) => setSelectedResumeId(event.target.value)}
+                  className="h-10 w-full rounded-lg border border-line bg-card px-3 text-sm"
                 >
-                  {item.status === "In progress" ? (
-                    <Play className="size-4 fill-current" />
-                  ) : (
-                    index + 1
-                  )}
-                </span>
-                {index < roadmap.length - 1 && (
-                  <span className="absolute top-9 h-full w-px bg-line" />
-                )}
+                  {resumes.map((resume) => (
+                    <option key={resume.id} value={resume.id}>{resume.file_name}</option>
+                  ))}
+                </select>
               </div>
-              <div className="min-w-0 flex-1 rounded-xl border border-line bg-paper/35 p-4 sm:p-5">
-                <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
-                  <div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-brand">
-                        {item.phase}
-                      </span>
-                      <StatusBadge status={item.status} />
+
+              <div>
+                <label htmlFor="roadmap-job" className="mb-1.5 block text-sm font-medium">Target job</label>
+                <select
+                  id="roadmap-job"
+                  value={selectedJobId}
+                  onChange={(event) => setSelectedJobId(event.target.value)}
+                  className="h-10 w-full rounded-lg border border-line bg-card px-3 text-sm"
+                >
+                  {jobs.map((job) => (
+                    <option key={job.id} value={job.id}>{job.title} · {job.company}</option>
+                  ))}
+                </select>
+              </div>
+
+              <Button
+                className="w-full rounded-lg bg-brand text-primary-foreground hover:bg-brand-deep"
+                onClick={() => void handleGenerate()}
+                disabled={!canGenerate}
+              >
+                {generating ? "Generating roadmap…" : "Generate Career Roadmap"}
+              </Button>
+
+              {error && (
+                <p className="rounded-lg border border-destructive/20 bg-destructive/5 p-3 text-sm text-destructive" role="alert">
+                  {error}
+                </p>
+              )}
+            </div>
+          )}
+        </section>
+
+        <section className="space-y-6">
+          {!user || loading ? null : !selectedResumeId || !selectedJobId ? (
+            <div className="app-surface rounded-xl bg-card/70 p-5">
+              <p className="text-sm text-muted-foreground">Select a resume and target job to view a roadmap.</p>
+            </div>
+          ) : !roadmapData ? (
+            <div className="app-surface rounded-xl bg-card/70 p-5">
+              <p className="text-sm text-muted-foreground">No roadmap has been generated for this resume and role yet.</p>
+            </div>
+          ) : (
+            <div className="app-surface rounded-xl bg-card/70 p-5 sm:p-7">
+              <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end">
+                <div>
+                  <p className="text-xs uppercase tracking-[0.14em] text-brand">Career goal</p>
+                  <h2 className="mt-2 font-display text-2xl font-semibold">{roadmapData.goal}</h2>
+                  <p className="mt-1 text-sm text-muted-foreground">Built for {roadmapData.target_role}.</p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <div className="text-right">
+                    <p className="text-2xl font-display font-semibold">{roadmapData.estimated_duration}</p>
+                    <p className="text-[10px] uppercase tracking-wider text-muted-foreground">Estimated</p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-8 grid gap-4 sm:grid-cols-3">
+                <div className="rounded-xl border border-line bg-paper/35 p-4">
+                  <p className="text-xs uppercase tracking-[0.14em] text-brand">Target role</p>
+                  <p className="mt-2 font-medium">{roadmapData.target_role}</p>
+                </div>
+                <div className="rounded-xl border border-line bg-paper/35 p-4">
+                  <p className="text-xs uppercase tracking-[0.14em] text-brand">Current level</p>
+                  <p className="mt-2 font-medium">{roadmapData.current_level}</p>
+                </div>
+                <div className="rounded-xl border border-line bg-paper/35 p-4">
+                  <p className="text-xs uppercase tracking-[0.14em] text-brand">Duration</p>
+                  <p className="mt-2 font-medium">{roadmapData.estimated_duration}</p>
+                </div>
+              </div>
+
+              <div className="mt-8 space-y-5">
+                {roadmapData.phases.map((phase, index) => (
+                  <div key={`${phase.title}-${index}`} className="rounded-xl border border-line bg-paper/35 p-4 sm:p-5">
+                    <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
+                      <div>
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-brand">Phase {index + 1}</p>
+                        <h3 className="mt-2 font-display text-lg font-semibold">{phase.title}</h3>
+                      </div>
+                      <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                        <Clock3 className="size-3.5" />
+                        {phase.duration}
+                      </div>
                     </div>
-                    <h3 className="mt-2 font-display text-lg font-semibold">{item.topic}</h3>
-                    <p className="mt-1 max-w-2xl text-sm leading-relaxed text-muted-foreground">
-                      {item.description}
-                    </p>
+
+                    <div className="mt-4 grid gap-4 md:grid-cols-2">
+                      <div>
+                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Skills</p>
+                        <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                          {phase.skills.map((skill) => <li key={skill}>{skill}</li>)}
+                        </ul>
+                      </div>
+                      <div>
+                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Topics</p>
+                        <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                          {phase.topics.map((topic) => <li key={topic}>{topic}</li>)}
+                        </ul>
+                      </div>
+                    </div>
+
+                    <div className="mt-4 grid gap-4 md:grid-cols-2">
+                      <div>
+                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Practice tasks</p>
+                        <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                          {phase.practice_tasks.map((task) => <li key={task}>{task}</li>)}
+                        </ul>
+                      </div>
+                      <div>
+                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Project</p>
+                        <p className="mt-2 text-sm text-muted-foreground">{phase.project}</p>
+                      </div>
+                    </div>
                   </div>
-                  <div className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
-                    <Clock3 className="size-3.5" />
-                    {item.effort}
-                  </div>
-                </div>
-                <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-3">
-                  <p className="text-xs text-muted-foreground">
-                    Recommended action:{" "}
-                    <span className="font-medium text-foreground">{item.action}</span>
-                  </p>
-                  <Button variant="ghost" size="sm" className="text-brand">
-                    Open milestone <ArrowRight className="size-3.5" />
-                  </Button>
-                </div>
+                ))}
+              </div>
+
+              <div className="mt-8 rounded-xl border border-line bg-paper/35 p-4 sm:p-5">
+                <p className="text-xs font-semibold uppercase tracking-[0.14em] text-brand">Final project</p>
+                <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{roadmapData.final_project}</p>
+              </div>
+
+              <div className="mt-8 rounded-xl border border-line bg-paper/35 p-4 sm:p-5">
+                <p className="text-xs font-semibold uppercase tracking-[0.14em] text-brand">Milestones</p>
+                <ul className="mt-3 list-disc space-y-2 pl-5 text-sm text-muted-foreground">
+                  {roadmapData.milestones.map((milestone) => <li key={milestone}>{milestone}</li>)}
+                </ul>
               </div>
             </div>
-          ))}
-        </div>
+          )}
+        </section>
       </div>
     </AppShell>
   );
