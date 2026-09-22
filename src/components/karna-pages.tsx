@@ -78,6 +78,7 @@ import {
   getLatestResumeAnalysis,
   getProcessedResumes,
   getUserJobMatches,
+  type Job,
   type JobMatch,
 } from "@/lib/job-matching-service";
 import { calculateSkillGap, type SkillGapResult } from "@/lib/skill-gap";
@@ -957,7 +958,9 @@ function AnalysisItem({ children }: { children: ReactNode }) {
 export function JobsPage() {
   const { user, isLoading: authLoading } = useAuth();
   const [resumes, setResumes] = useState<Array<{ id: string; file_name: string; status: string }>>([]);
+  const [jobs, setJobs] = useState<Job[]>([]);
   const [selectedResumeId, setSelectedResumeId] = useState("");
+  const [selectedJobId, setSelectedJobId] = useState("");
   const [matches, setMatches] = useState<JobMatch[]>([]);
   const [hasAnalysis, setHasAnalysis] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -970,12 +973,19 @@ export function JobsPage() {
     }
     setLoading(true);
     try {
-      const processedResumes = await getProcessedResumes();
+      const [processedResumes, availableJobs] = await Promise.all([
+        getProcessedResumes(),
+        getAvailableJobs(),
+      ]);
       setResumes(processedResumes);
+      setJobs(availableJobs);
       const nextResumeId = selectedResumeId && processedResumes.some((resume) => resume.id === selectedResumeId)
         ? selectedResumeId
         : processedResumes[0]?.id ?? "";
       setSelectedResumeId(nextResumeId);
+      setSelectedJobId((current) => current && availableJobs.some((job) => job.id === current)
+        ? current
+        : availableJobs[0]?.id ?? "");
       if (nextResumeId) {
         const [analysis, storedMatches] = await Promise.all([
           getLatestResumeAnalysis(nextResumeId),
@@ -1026,6 +1036,7 @@ export function JobsPage() {
       setMatching(false);
     }
   };
+
   return (
     <AppShell title="Job Matching" eyebrow="Role alignment">
       <div className="grid gap-6 xl:grid-cols-[0.9fr_1.1fr]">
