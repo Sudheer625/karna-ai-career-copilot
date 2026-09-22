@@ -50,7 +50,6 @@ import {
   StatusBadge,
   UploadPanel,
   demoProfile,
-  jobAnalysis,
   roadmap,
   skills,
 } from "@/components/karna-ui";
@@ -73,6 +72,13 @@ import {
   type UserSkill,
 } from "@/lib/profile-service";
 import { supabase } from "@/lib/supabase";
+import {
+  generateJobMatches,
+  getLatestResumeAnalysis,
+  getProcessedResumes,
+  getUserJobMatches,
+  type JobMatch,
+} from "@/lib/job-matching-service";
 import {
   analyzeUserResume,
   deleteResume,
@@ -946,125 +952,165 @@ function AnalysisItem({ children }: { children: ReactNode }) {
 }
 
 export function JobsPage() {
-  const [analyzed, setAnalyzed] = useState(true);
-  const [description, setDescription] = useState(
-    "We are looking for a Machine Learning Engineer to build, evaluate, and deploy models with Python, SQL, Pandas, and modern MLOps tools.",
-  );
+  const { user, isLoading: authLoading } = useAuth();
+  const [resumes, setResumes] = useState<Array<{ id: string; file_name: string; status: string }>>([]);
+  const [selectedResumeId, setSelectedResumeId] = useState("");
+  const [matches, setMatches] = useState<JobMatch[]>([]);
+  const [hasAnalysis, setHasAnalysis] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [matching, setMatching] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const load = useCallback(async () => {
+    if (!user) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    try {
+      const processedResumes = await getProcessedResumes();
+      setResumes(processedResumes);
+      const nextResumeId = selectedResumeId && processedResumes.some((resume) => resume.id === selectedResumeId)
+        ? selectedResumeId
+        : processedResumes[0]?.id ?? "";
+      setSelectedResumeId(nextResumeId);
+      if (nextResumeId) {
+        const [analysis, storedMatches] = await Promise.all([
+          getLatestResumeAnalysis(nextResumeId),
+          getUserJobMatches(nextResumeId),
+        ]);
+        setHasAnalysis(Boolean(analysis));
+        setMatches(storedMatches);
+      }
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "We could not load job matching data.");
+    } finally {
+      setLoading(false);
+    }
+  }, [selectedResumeId, user]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const selectResume = async (resumeId: string) => {
+    setSelectedResumeId(resumeId);
+    setError(null);
+    try {
+      const [analysis, storedMatches] = await Promise.all([
+        getLatestResumeAnalysis(resumeId),
+        getUserJobMatches(resumeId),
+      ]);
+      setHasAnalysis(Boolean(analysis));
+      setMatches(storedMatches);
+    } catch (selectError) {
+      setError(selectError instanceof Error ? selectError.message : "We could not load this resume.");
+    }
+  };
+
+  const findMatches = async () => {
+    if (!selectedResumeId) return;
+    setMatching(true);
+    setError(null);
+    try {
+      const generatedMatches = await generateJobMatches(selectedResumeId);
+      setMatches(generatedMatches);
+      setHasAnalysis(true);
+      if (generatedMatches.length > 0) toast.success("Job matches generated.");
+      else setError("[NO_MATCHES] No job matches were found.");
+    } catch (matchError) {
+      setError(matchError instanceof Error ? matchError.message : "We could not generate job matches.");
+    } finally {
+      setMatching(false);
+    }
+  };
   return (
     <AppShell title="Job Matching" eyebrow="Role alignment">
       <div className="grid gap-6 xl:grid-cols-[0.9fr_1.1fr]">
         <section className="app-surface rounded-xl bg-card/70 p-5">
           <SectionHeader
-            title="Analyze a job description"
-            detail="Paste a role to compare it with your demo profile"
+            title="Find matching jobs"
+            detail="Compare your stored resume analysis with available roles"
           />
-          <div className="mt-6 space-y-4">
-            <div>
-              <label htmlFor="job-title" className="mb-1.5 block text-sm font-medium">
-                Job title
-              </label>
-              <Input id="job-title" defaultValue={jobAnalysis.title} />
-            </div>
-            <div>
-              <label htmlFor="company" className="mb-1.5 block text-sm font-medium">
-                Company
-              </label>
-              <Input id="company" defaultValue={jobAnalysis.company} />
-            </div>
-            <div>
-              <label htmlFor="description" className="mb-1.5 block text-sm font-medium">
-                Job description
-              </label>
-              <Textarea
-                id="description"
-                value={description}
-                onChange={(event) => setDescription(event.target.value)}
-                className="min-h-44 resize-y"
-              />
-            </div>
-            <div className="flex flex-wrap items-center gap-3">
+          {loading || authLoading ? (
+            <p className="mt-6 text-sm text-muted-foreground" aria-busy="true">Loading matching data…</p>
+          ) : !user ? (
+            <p className="mt-6 text-sm text-muted-foreground">Sign in to find matching jobs.</p>
+          ) : resumes.length === 0 ? (
+            <EmptyState
+              icon={FileText}
+              title="Upload and process your resume first."
+              detail="A processed resume is required before deterministic job matching can run."
+              action={<Button asChild variant="outline" className="rounded-lg"><Link to="/resume">Go to Resume Analyzer</Link></Button>}
+            />
+          ) : (
+            <div className="mt-6 space-y-4">
+              <div>
+                <label htmlFor="resume-select" className="mb-1.5 block text-sm font-medium">Resume</label>
+                <select
+                  id="resume-select"
+                  value={selectedResumeId}
+                  onChange={(event) => void selectResume(event.target.value)}
+                  className="h-10 w-full rounded-lg border border-line bg-card px-3 text-sm"
+                >
+                  {resumes.map((resume) => <option key={resume.id} value={resume.id}>{resume.file_name}</option>)}
+                </select>
+              </div>
               <Button
                 className="rounded-lg bg-brand text-primary-foreground hover:bg-brand-deep"
-                onClick={() => setAnalyzed(true)}
+                onClick={() => void findMatches()}
+                disabled={!hasAnalysis || matching}
               >
-                <Sparkles className="size-4" /> Analyze Job
+                <Target className="size-4" /> {matching ? "Finding Matches" : "Find Matching Jobs"}
               </Button>
-              <Button variant="outline" className="rounded-lg">
-                <Upload className="size-4" /> Upload JD
-              </Button>
+              {!hasAnalysis && (
+                <div className="rounded-lg border border-warning/20 bg-warning/10 p-3 text-sm text-warning">
+                  Analyze your resume first to generate job matches.
+                  <Button asChild variant="link" className="h-auto px-1 text-warning"><Link to="/resume">Analyze Resume</Link></Button>
+                </div>
+              )}
+              {error && <p className="text-sm text-destructive" role="alert">{error}</p>}
             </div>
-            <p className="text-[11px] text-muted-foreground">
-              Analysis uses demo data in Phase 2. No job-board connection is active.
-            </p>
-          </div>
+          )}
         </section>
         <section className="space-y-6">
-          {analyzed ? (
-            <>
-              <div className="app-surface rounded-xl bg-card/70 p-5">
-                <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.14em] text-muted-foreground">
-                      Analyzed role
-                    </p>
-                    <h2 className="mt-2 font-display text-2xl font-semibold">
-                      {jobAnalysis.title}
-                    </h2>
-                    <p className="mt-1 text-sm text-muted-foreground">
-                      {jobAnalysis.company} · {jobAnalysis.location}
-                    </p>
-                  </div>
-                  <div className="rounded-xl bg-brand/10 px-4 py-3 text-center">
-                    <p className="text-[10px] uppercase tracking-wider text-brand">
-                      Profile alignment
-                    </p>
-                    <p className="mt-1 font-display text-3xl font-semibold text-brand">78%</p>
-                    <p className="text-[10px] text-muted-foreground">
-                      Application-generated indicator
-                    </p>
-                  </div>
-                </div>
-                <div className="mt-6 grid gap-5 sm:grid-cols-2">
-                  <SkillGroup
-                    title="Required skills"
-                    skills={jobAnalysis.required}
-                    tone="success"
-                  />
-                  <SkillGroup
-                    title="Preferred skills"
-                    skills={jobAnalysis.preferred}
-                    tone="warning"
-                  />
-                </div>
-              </div>
-              <div className="app-surface rounded-xl bg-card/70 p-5">
-                <SectionHeader
-                  title="Responsibilities"
-                  detail="Extracted from the role description"
-                />
-                <ul className="mt-5 space-y-3">
-                  {jobAnalysis.responsibilities.map((item) => (
-                    <li
-                      key={item}
-                      className="flex gap-3 text-sm leading-relaxed text-muted-foreground"
-                    >
-                      <span className="mt-1 text-brand">•</span>
-                      {item}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            </>
-          ) : (
+          {matches.length === 0 ? (
             <EmptyState
               icon={Briefcase}
-              title="Your job analysis will appear here"
-              detail="Paste a job description and analyze it against your current profile."
+              title="Your job matches will appear here"
+              detail="Choose a processed resume with completed analysis, then find matching jobs."
             />
-          )}
+          ) : matches.map((match) => <JobMatchCard key={match.id} match={match} />)}
         </section>
       </div>
     </AppShell>
+  );
+}
+
+function JobMatchCard({ match }: { match: JobMatch }) {
+  return (
+    <div className="app-surface rounded-xl bg-card/70 p-5">
+      <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
+        <div>
+          <p className="text-xs uppercase tracking-[0.14em] text-muted-foreground">Deterministic match</p>
+          <h2 className="mt-2 font-display text-xl font-semibold">{match.job.title}</h2>
+          <p className="mt-1 text-sm text-muted-foreground">{match.job.company} · {match.job.location}</p>
+          <p className="mt-1 text-xs text-muted-foreground">{match.job.employment_type} · {match.job.experience_level}</p>
+        </div>
+        <div className="rounded-xl bg-brand/10 px-4 py-3 text-center">
+          <p className="text-[10px] uppercase tracking-wider text-brand">Match</p>
+          <p className="mt-1 font-display text-3xl font-semibold text-brand">{match.match_score}%</p>
+        </div>
+      </div>
+      <div className="mt-5 grid gap-5 sm:grid-cols-2">
+        <SkillGroup title="Matched skills" skills={match.matched_skills} tone="success" />
+        <SkillGroup title="Missing required skills" skills={match.missing_skills} tone="warning" />
+      </div>
+      {match.job.application_url && (
+        <Button asChild variant="outline" className="mt-5 rounded-lg">
+          <a href={match.job.application_url} target="_blank" rel="noreferrer">View Job</a>
+        </Button>
+      )}
+    </div>
   );
 }
 function SkillGroup({
