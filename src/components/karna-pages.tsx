@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import {
   type LucideIcon,
@@ -23,7 +23,6 @@ import {
   Play,
   Plus,
   Save,
-  Send,
   ShieldCheck,
   Sparkles,
   Target,
@@ -53,7 +52,7 @@ import {
   roadmap,
   skills,
 } from "@/components/karna-ui";
-import { mockServices, interviewQuestion } from "@/lib/mock-data";
+import { mockServices } from "@/lib/mock-data";
 import { toast } from "sonner";
 import { useAuth } from "@/auth/auth-provider";
 import { useUserIdentity } from "@/hooks/use-user-identity";
@@ -81,6 +80,7 @@ import {
   type Job,
   type JobMatch,
 } from "@/lib/job-matching-service";
+import { generateInterviewQuestions, type InterviewQuestionRecord } from "@/lib/interview-service";
 import { generateCareerRoadmap, type CareerRoadmap } from "@/lib/career-roadmap";
 import { calculateSkillGap, type SkillGapResult } from "@/lib/skill-gap";
 import { normalizeSkill } from "@/lib/job-matching";
@@ -1577,198 +1577,533 @@ export function RoadmapPage() {
 }
 
 export function InterviewPage() {
-  const [started, setStarted] = useState(false);
-  const [submitted, setSubmitted] = useState(false);
+  type InterviewSession = {
+    id: string;
+    user_id: string;
+    resume_id: string;
+    job_id: string;
+    target_role: string | null;
+    interview_type: string;
+    status: "created" | "in_progress" | "completed";
+  };
+  type InterviewQuestion = InterviewQuestionRecord & { user_answer: string | null };
+
+  const { user, isLoading: authLoading } = useAuth();
+  const [resumes, setResumes] = useState<Array<{ id: string; file_name: string }>>([]);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [selectedResumeId, setSelectedResumeId] = useState("");
+  const [selectedJobId, setSelectedJobId] = useState("");
+  const [interviewType, setInterviewType] = useState("technical");
+  const [activeSession, setActiveSession] = useState<InterviewSession | null>(null);
+  const [questions, setQuestions] = useState<InterviewQuestion[]>([]);
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [dirtyAnswers, setDirtyAnswers] = useState<Record<string, boolean>>({});
+  const [answerSaveStatus, setAnswerSaveStatus] = useState<Record<string, "unsaved" | "saving" | "saved" | "failed">>({});
+  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const [dataLoading, setDataLoading] = useState(true);
+  const [sessionLoading, setSessionLoading] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [savingAnswer, setSavingAnswer] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const answerVersions = useRef<Record<string, number>>({});
+  const latestAnswers = useRef<Record<string, string>>({});
+  const answerSaveQueue = useRef(new Map<string, Promise<void>>());
+  const debounceTimers = useRef(new Map<string, number>());
+
+  const loadSessionQuestions = useCallback(async (sessionId: string): Promise<InterviewQuestion[]> => {
+    const { data, error: questionError } = await supabase
+      .from("interview_questions")
+      .select("id, session_id, question_order, question, category, difficulty, user_answer, created_at, updated_at")
+      .eq("session_id", sessionId)
+      .order("question_order", { ascending: true });
+    if (questionError) throw new Error("We could not load the interview questions.");
+    return (data ?? []) as InterviewQuestion[];
+  }, []);
+
+  const saveAnswer = useCallback(async (sessionId: string, questionId: string, answer: string) => {
+    const previousSave = answerSaveQueue.current.get(questionId) ?? Promise.resolve();
+    const currentSave = previousSave.catch(() => undefined).then(async () => {
+      const { data, error: saveError } = await supabase
+        .from("interview_questions")
+        .update({ user_answer: answer })
+        .eq("id", questionId)
+        .eq("session_id", sessionId)
+        .select("id")
+        .maybeSingle();
+      if (saveError || !data) throw new Error("We could not save your answer. Please try again.");
+    });
+    answerSaveQueue.current.set(questionId, currentSave);
+    try {
+      await currentSave;
+    } finally {
+      if (answerSaveQueue.current.get(questionId) === currentSave) {
+        answerSaveQueue.current.delete(questionId);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (authLoading) return;
+    if (!user) {
+      setResumes([]);
+      setJobs([]);
+      setSelectedResumeId("");
+      setSelectedJobId("");
+      setDataLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setDataLoading(true);
+    setError(null);
+    void Promise.all([getProcessedResumes(), listUserResumeAnalyses(), getAvailableJobs()])
+      .then(([processedResumes, analyses, availableJobs]) => {
+        if (cancelled) return;
+        const analyzedResumeIds = new Set(
+          analyses.filter((analysis) => analysis.status === "completed").map((analysis) => analysis.resume_id),
+        );
+        const usableResumes = processedResumes
+          .filter((resume) => analyzedResumeIds.has(resume.id))
+          .map(({ id, file_name }) => ({ id, file_name }));
+        setResumes(usableResumes);
+        setJobs(availableJobs);
+        setSelectedResumeId((current) =>
+          usableResumes.some((resume) => resume.id === current) ? current : usableResumes[0]?.id ?? "",
+        );
+        setSelectedJobId((current) =>
+          availableJobs.some((job) => job.id === current) ? current : availableJobs[0]?.id ?? "",
+        );
+      })
+      .catch((loadError: unknown) => {
+        if (!cancelled) {
+          setError(loadError instanceof Error ? loadError.message : "We could not load interview data.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setDataLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authLoading, user]);
+
+  useEffect(() => {
+    if (!user || !selectedResumeId || !selectedJobId) {
+      setActiveSession(null);
+      setQuestions([]);
+      setAnswers({});
+      setDirtyAnswers({});
+      setSessionLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setSessionLoading(true);
+    setError(null);
+    const restoreSession = async () => {
+      const { data: session, error: sessionError } = await supabase
+        .from("interview_sessions")
+        .select("id, user_id, resume_id, job_id, target_role, interview_type, status")
+        .eq("user_id", user.id)
+        .eq("resume_id", selectedResumeId)
+        .eq("job_id", selectedJobId)
+        .eq("interview_type", interviewType)
+        .in("status", ["created", "in_progress"])
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle<InterviewSession>();
+      if (sessionError) throw new Error("We could not check for an existing interview.");
+      if (!session) {
+        if (!cancelled) {
+          setActiveSession(null);
+          setQuestions([]);
+          setAnswers({});
+          setDirtyAnswers({});
+        }
+        return;
+      }
+
+      const storedQuestions = await loadSessionQuestions(session.id);
+      const validQuestions = storedQuestions.length === 8 && storedQuestions.every(
+        (question, index) => question.question_order === index + 1,
+      );
+      if (cancelled) return;
+
+      let restoredSession = session;
+      if (validQuestions && session.status === "created") {
+        const { error: statusError } = await supabase
+          .from("interview_sessions")
+          .update({ status: "in_progress" })
+          .eq("id", session.id)
+          .eq("user_id", user.id);
+        if (statusError) throw new Error("We could not resume this interview.");
+        restoredSession = { ...session, status: "in_progress" };
+      }
+
+      setActiveSession(restoredSession);
+      setQuestions(validQuestions ? storedQuestions : []);
+      const restoredAnswers = validQuestions
+        ? Object.fromEntries(storedQuestions.map((question) => [question.id, question.user_answer ?? ""]))
+        : {};
+      latestAnswers.current = restoredAnswers;
+      setAnswers(restoredAnswers);
+      setDirtyAnswers({});
+      setAnswerSaveStatus({});
+      answerVersions.current = {};
+      setCurrentQuestionIndex(0);
+    };
+
+    void restoreSession()
+      .catch((loadError: unknown) => {
+        if (!cancelled) setError(loadError instanceof Error ? loadError.message : "We could not resume this interview.");
+      })
+      .finally(() => {
+        if (!cancelled) setSessionLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user, selectedResumeId, selectedJobId, interviewType, loadSessionQuestions]);
+
+  const currentQuestion = questions[currentQuestionIndex];
+  const currentAnswer = currentQuestion ? answers[currentQuestion.id] ?? "" : "";
+
+  useEffect(() => {
+    if (!activeSession || activeSession.status !== "in_progress" || !currentQuestion) return;
+    if (!dirtyAnswers[currentQuestion.id]) return;
+
+    const answer = answers[currentQuestion.id] ?? "";
+    const answerVersion = answerVersions.current[currentQuestion.id] ?? 0;
+    const timer = window.setTimeout(() => {
+      debounceTimers.current.delete(currentQuestion.id);
+      setAnswerSaveStatus((current) => ({ ...current, [currentQuestion.id]: "saving" }));
+      void saveAnswer(activeSession.id, currentQuestion.id, answer)
+        .then(() => {
+          if ((answerVersions.current[currentQuestion.id] ?? 0) === answerVersion) {
+            setDirtyAnswers((current) => ({ ...current, [currentQuestion.id]: false }));
+            setAnswerSaveStatus((current) => ({ ...current, [currentQuestion.id]: "saved" }));
+            setError(null);
+          }
+        })
+        .catch((saveError: unknown) => {
+          if ((answerVersions.current[currentQuestion.id] ?? 0) === answerVersion) {
+            setAnswerSaveStatus((current) => ({ ...current, [currentQuestion.id]: "failed" }));
+            setError(saveError instanceof Error ? saveError.message : "We could not save your answer.");
+          }
+        })
+    }, 1000);
+    debounceTimers.current.set(currentQuestion.id, timer);
+
+    return () => {
+      window.clearTimeout(timer);
+      if (debounceTimers.current.get(currentQuestion.id) === timer) {
+        debounceTimers.current.delete(currentQuestion.id);
+      }
+    };
+  }, [activeSession, answers, currentQuestion, dirtyAnswers, saveAnswer]);
+
+  useEffect(() => () => {
+    for (const timer of debounceTimers.current.values()) window.clearTimeout(timer);
+    debounceTimers.current.clear();
+  }, []);
+
+  const startInterview = async () => {
+    if (!user || !selectedResumeId || !selectedJobId) return;
+    setStarting(true);
+    setError(null);
+    try {
+      const { data: sessionData, error: authError } = await supabase.auth.getSession();
+      if (authError || !sessionData.session) throw new Error("Please sign in to start an interview.");
+
+      let session = activeSession;
+      if (!session || session.resume_id !== selectedResumeId || session.job_id !== selectedJobId || session.status === "completed") {
+        const selectedJob = jobs.find((job) => job.id === selectedJobId);
+        const { data: createdSession, error: createError } = await supabase
+          .from("interview_sessions")
+          .insert({
+            user_id: user.id,
+            resume_id: selectedResumeId,
+            job_id: selectedJobId,
+            target_role: selectedJob?.title ?? null,
+            interview_type: interviewType,
+            status: "created",
+          })
+          .select("id, user_id, resume_id, job_id, target_role, interview_type, status")
+          .single<InterviewSession>();
+        if (createError || !createdSession) throw new Error("We could not create the interview session.");
+        session = createdSession;
+        setActiveSession(session);
+      }
+
+      await generateInterviewQuestions({
+        data: { sessionId: session.id },
+        headers: { Authorization: `Bearer ${sessionData.session.access_token}` },
+      });
+      const generatedQuestions = await loadSessionQuestions(session.id);
+      if (generatedQuestions.length !== 8 || !generatedQuestions.every(
+        (question, index) => question.question_order === index + 1,
+      )) {
+        throw new Error("The interview questions could not be loaded. Please try again.");
+      }
+
+      setActiveSession({ ...session, status: "in_progress" });
+      setQuestions(generatedQuestions);
+      const generatedAnswers = Object.fromEntries(
+        generatedQuestions.map((question) => [question.id, question.user_answer ?? ""]),
+      );
+      latestAnswers.current = generatedAnswers;
+      setAnswers(generatedAnswers);
+      setDirtyAnswers({});
+      setAnswerSaveStatus({});
+      answerVersions.current = {};
+      setCurrentQuestionIndex(0);
+    } catch (startError) {
+      setError(startError instanceof Error ? startError.message : "We could not start the interview. Please try again.");
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const saveAndMove = async (nextIndex: number) => {
+    if (!user || !activeSession || !currentQuestion) return;
+    const pendingTimer = debounceTimers.current.get(currentQuestion.id);
+    if (pendingTimer !== undefined) {
+      window.clearTimeout(pendingTimer);
+      debounceTimers.current.delete(currentQuestion.id);
+    }
+    setSavingAnswer(true);
+    setAnswerSaveStatus((current) => ({ ...current, [currentQuestion.id]: "saving" }));
+    setError(null);
+    try {
+      let savedVersion: number;
+      do {
+        savedVersion = answerVersions.current[currentQuestion.id] ?? 0;
+        const latestAnswer = latestAnswers.current[currentQuestion.id] ?? currentAnswer;
+        await saveAnswer(activeSession.id, currentQuestion.id, latestAnswer);
+      } while ((answerVersions.current[currentQuestion.id] ?? 0) !== savedVersion);
+      setDirtyAnswers((current) => ({ ...current, [currentQuestion.id]: false }));
+      setAnswerSaveStatus((current) => ({ ...current, [currentQuestion.id]: "saved" }));
+      if (nextIndex >= questions.length) {
+        const { data: updatedSession, error: completionError } = await supabase
+          .from("interview_sessions")
+          .update({ status: "completed" })
+          .eq("id", activeSession.id)
+          .eq("user_id", user.id)
+          .select("id")
+          .maybeSingle();
+        if (completionError || !updatedSession) throw new Error("Your final answer was saved, but the interview could not be completed. Please try again.");
+        setActiveSession({ ...activeSession, status: "completed" });
+      } else {
+        setCurrentQuestionIndex(nextIndex);
+      }
+    } catch (saveError) {
+      setAnswerSaveStatus((current) => ({ ...current, [currentQuestion.id]: "failed" }));
+      setError(saveError instanceof Error ? saveError.message : "We could not save your answer. Please try again.");
+    } finally {
+      setSavingAnswer(false);
+    }
+  };
+
+  const beginAnotherInterview = () => {
+    setActiveSession(null);
+    setQuestions([]);
+    latestAnswers.current = {};
+    answerVersions.current = {};
+    setAnswers({});
+    setDirtyAnswers({});
+    setAnswerSaveStatus({});
+    setCurrentQuestionIndex(0);
+  };
+
+  const validSelection = Boolean(selectedResumeId && selectedJobId);
+  const hasQuestionSet = questions.length === 8 && activeSession !== null;
+
   return (
     <AppShell title="Interview Preparation" eyebrow="Practice with role-specific questions">
-      {!started ? (
-        <div className="grid gap-6 xl:grid-cols-[0.8fr_1.2fr]">
-          <section className="app-surface rounded-xl bg-card/70 p-6">
-            <div className="grid size-12 place-items-center rounded-xl bg-brand/10 text-brand">
-              <MessageSquareText className="size-5" />
-            </div>
-            <h2 className="mt-5 font-display text-2xl font-semibold">
-              Prepare for the conversation.
-            </h2>
-            <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-              Choose a role, interview style, and difficulty. KARNA will create a focused mock
-              session for this demo.
-            </p>
-            <div className="mt-7 space-y-5">
-              <FieldSelect
-                label="Target role"
-                value="Machine Learning Engineer"
-                options={["Machine Learning Engineer", "Data Analyst", "Software Engineer"]}
-              />
-              <FieldSelect
-                label="Interview type"
-                value="Mixed"
-                options={["Technical", "HR", "Project", "Mixed"]}
-              />
-              <FieldSelect
-                label="Difficulty"
-                value="Intermediate"
-                options={["Beginner", "Intermediate", "Advanced"]}
-              />
-            </div>
-            <Button
-              className="mt-7 w-full rounded-lg bg-brand text-primary-foreground hover:bg-brand-deep"
-              onClick={() => setStarted(true)}
-            >
-              <Play className="size-4" /> Start Interview
-            </Button>
-          </section>
-          <section className="rounded-xl bg-ink p-6 text-paper sm:p-8">
-            <div className="flex items-center gap-2 text-signal">
-              <ShieldCheck className="size-5" />
-              <span className="text-xs font-semibold uppercase tracking-[0.14em]">
-                Session preview
-              </span>
-            </div>
-            <h2 className="mt-8 max-w-md font-display text-3xl font-semibold">
-              A calmer way to rehearse your next answer.
-            </h2>
-            <div className="mt-8 grid gap-3 sm:grid-cols-2">
-              {[
-                ["10", "questions"],
-                ["3", "feedback signals"],
-                ["1", "target role"],
-              ].map(([number, label]) => (
-                <div key={label} className="rounded-xl bg-paper/5 p-4 ring-1 ring-paper/10">
-                  <p className="font-display text-2xl font-semibold">{number}</p>
-                  <p className="mt-1 text-xs text-paper/55">{label}</p>
-                </div>
-              ))}
-            </div>
-            <p className="mt-8 max-w-md text-sm leading-relaxed text-paper/60">
-              You’ll receive feedback on relevance, clarity, and technical depth — not a hiring
-              verdict.
-            </p>
-          </section>
-        </div>
-      ) : (
-        <div className="mx-auto max-w-3xl">
-          <div className="mb-5 flex items-center justify-between">
-            <div>
-              <p className="text-xs uppercase tracking-[0.14em] text-brand">
-                Technical · Intermediate
-              </p>
-              <h2 className="mt-2 font-display text-2xl font-semibold">Question 1 of 10</h2>
-            </div>
-            <Button
-              variant="outline"
-              className="rounded-lg"
-              onClick={() => {
-                setStarted(false);
-                setSubmitted(false);
-              }}
-            >
-              End session
-            </Button>
+      <div className="grid gap-6 xl:grid-cols-[0.8fr_1.2fr]">
+        <section className="app-surface rounded-xl bg-card/70 p-5 sm:p-6">
+          <div className="grid size-11 place-items-center rounded-xl bg-brand/10 text-brand">
+            <MessageSquareText className="size-5" />
           </div>
-          <section className="app-surface rounded-xl bg-card/70 p-6 sm:p-8">
-            <div className="flex items-center justify-between">
-              <Badge className="rounded-full bg-brand/10 text-brand">
-                Machine Learning Engineer
-              </Badge>
-              <span className="text-xs text-muted-foreground">Progress 10%</span>
+          <h2 className="mt-5 font-display text-2xl font-semibold">Prepare for the conversation.</h2>
+          <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
+            Choose an analyzed resume and a target role to begin.
+          </p>
+
+          {dataLoading || authLoading ? (
+            <p className="mt-6 text-sm text-muted-foreground" aria-busy="true">Loading interview options…</p>
+          ) : !user ? (
+            <p className="mt-6 text-sm text-muted-foreground">Sign in to prepare for an interview.</p>
+          ) : resumes.length === 0 ? (
+            <div className="mt-6">
+              <EmptyState
+                icon={FileText}
+                title="No analyzed resume available"
+                detail="Process and analyze a resume before starting an interview."
+                action={<Button asChild variant="outline" className="rounded-lg"><Link to="/resume">Analyze Resume</Link></Button>}
+              />
             </div>
-            <h3 className="mt-8 font-display text-2xl font-semibold leading-tight">
-              {interviewQuestion}
-            </h3>
-            {!submitted ? (
-              <>
-                <label htmlFor="answer" className="mt-8 block text-sm font-medium">
-                  Your answer
-                </label>
-                <Textarea
-                  id="answer"
-                  placeholder="Write your answer here…"
-                  className="mt-2 min-h-44"
-                />
-                <div className="mt-5 flex flex-wrap justify-end gap-3">
-                  <Button variant="outline" className="rounded-lg">
-                    Skip
-                  </Button>
-                  <Button
-                    className="rounded-lg bg-brand text-primary-foreground hover:bg-brand-deep"
-                    onClick={() => setSubmitted(true)}
-                  >
-                    <Send className="size-4" /> Submit Answer
-                  </Button>
-                </div>
-              </>
-            ) : (
-              <div className="mt-8">
-                <div className="rounded-xl border border-success/20 bg-success/5 p-4">
-                  <div className="flex items-center gap-2 text-success">
-                    <CircleCheck className="size-4" />
-                    <span className="text-sm font-medium">Answer evaluated</span>
-                  </div>
-                  <p className="mt-2 text-sm text-muted-foreground">
-                    Your answer is correct but could include a concrete example.
+          ) : jobs.length === 0 ? (
+            <div className="mt-6">
+              <EmptyState icon={Briefcase} title="No target jobs available" detail="There are no jobs available for interview practice yet." />
+            </div>
+          ) : (
+            <div className="mt-6 space-y-4">
+              <div>
+                <label htmlFor="interview-resume" className="mb-1.5 block text-sm font-medium">Resume</label>
+                <select
+                  id="interview-resume"
+                  value={selectedResumeId}
+                  onChange={(event) => setSelectedResumeId(event.target.value)}
+                  className="h-10 w-full rounded-lg border border-line bg-card px-3 text-sm"
+                >
+                  {resumes.map((resume) => <option key={resume.id} value={resume.id}>{resume.file_name}</option>)}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="interview-job" className="mb-1.5 block text-sm font-medium">Target job</label>
+                <select
+                  id="interview-job"
+                  value={selectedJobId}
+                  onChange={(event) => setSelectedJobId(event.target.value)}
+                  className="h-10 w-full rounded-lg border border-line bg-card px-3 text-sm"
+                >
+                  {jobs.map((job) => <option key={job.id} value={job.id}>{job.title} · {job.company}</option>)}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="interview-type" className="mb-1.5 block text-sm font-medium">Interview type</label>
+                <select
+                  id="interview-type"
+                  value={interviewType}
+                  onChange={(event) => setInterviewType(event.target.value)}
+                  className="h-10 w-full rounded-lg border border-line bg-card px-3 text-sm"
+                >
+                  <option value="technical">Technical</option>
+                  <option value="behavioral">Behavioral</option>
+                  <option value="mixed">Mixed</option>
+                </select>
+              </div>
+              {activeSession && questions.length !== 8 && (
+                <p className="rounded-lg border border-line bg-paper/35 p-3 text-sm text-muted-foreground">
+                  An unfinished interview was found. Continue to load its questions and answers.
+                </p>
+              )}
+              <Button
+                className="w-full rounded-lg bg-brand text-primary-foreground hover:bg-brand-deep"
+                onClick={() => void startInterview()}
+                disabled={!validSelection || dataLoading || sessionLoading || starting || (hasQuestionSet && activeSession?.status !== "completed")}
+              >
+                <Play className="size-4" />
+                {starting ? "Starting Interview…" : activeSession && questions.length !== 8 ? "Continue Interview" : "Start Interview"}
+              </Button>
+            </div>
+          )}
+          {error && <p className="mt-4 rounded-lg border border-destructive/20 bg-destructive/5 p-3 text-sm text-destructive" role="alert">{error}</p>}
+        </section>
+
+        <section className="app-surface min-h-80 rounded-xl bg-card/70 p-5 sm:p-7">
+          {dataLoading || sessionLoading ? (
+            <p className="text-sm text-muted-foreground" aria-busy="true">Loading interview session…</p>
+          ) : activeSession?.status === "completed" ? (
+            <div className="mx-auto flex min-h-64 max-w-xl flex-col items-center justify-center text-center">
+              <CircleCheck className="size-10 text-success" />
+              <h2 className="mt-4 font-display text-2xl font-semibold">Interview complete</h2>
+              <p className="mt-2 text-sm text-muted-foreground">Your answers have been saved.</p>
+              <Button className="mt-6 rounded-lg bg-brand text-primary-foreground hover:bg-brand-deep" onClick={beginAnotherInterview}>
+                Start Another Interview
+              </Button>
+            </div>
+          ) : hasQuestionSet && currentQuestion && activeSession ? (
+            <div>
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div>
+                  <p className="text-xs uppercase tracking-[0.14em] text-brand">
+                    {activeSession.target_role ?? jobs.find((job) => job.id === activeSession.job_id)?.title ?? "Interview practice"}
                   </p>
+                  <h2 className="mt-2 font-display text-2xl font-semibold">
+                    Question {currentQuestionIndex + 1} of {questions.length}
+                  </h2>
                 </div>
-                <div className="mt-6 grid gap-3 sm:grid-cols-3">
-                  <MetricCard
-                    label="Relevance"
-                    value="82%"
-                    detail="Strong connection"
-                    icon={Target}
-                    tone="success"
-                  />
-                  <MetricCard
-                    label="Clarity"
-                    value="76%"
-                    detail="Easy to follow"
-                    icon={MessageSquareText}
-                    tone="brand"
-                  />
-                  <MetricCard
-                    label="Technical depth"
-                    value="71%"
-                    detail="Add one example"
-                    icon={Code2}
-                    tone="warning"
-                  />
-                </div>
-                <div className="mt-6 flex justify-end">
-                  <Button
-                    className="rounded-lg bg-brand text-primary-foreground hover:bg-brand-deep"
-                    onClick={() => setSubmitted(false)}
-                  >
-                    Next Question <ArrowRight className="size-4" />
-                  </Button>
+                <div className="flex gap-2">
+                  <Badge className="rounded-full bg-brand/10 text-brand">{currentQuestion.category}</Badge>
+                  <Badge variant="outline" className="rounded-full">{currentQuestion.difficulty}</Badge>
                 </div>
               </div>
-            )}
-          </section>
-        </div>
-      )}
+
+              <div
+                className="mt-5 h-2 overflow-hidden rounded-full bg-ink/10"
+                role="progressbar"
+                aria-label="Interview progress"
+                aria-valuemin={0}
+                aria-valuemax={questions.length}
+                aria-valuenow={currentQuestionIndex + 1}
+              >
+                <div className="h-full rounded-full bg-brand transition-[width]" style={{ width: `${((currentQuestionIndex + 1) / questions.length) * 100}%` }} />
+              </div>
+              <p className="mt-2 text-right text-xs text-muted-foreground">{Math.round(((currentQuestionIndex + 1) / questions.length) * 100)}% complete</p>
+
+              <h3 className="mt-7 font-display text-xl font-semibold leading-relaxed">{currentQuestion.question}</h3>
+              <label htmlFor="interview-answer" className="mt-7 block text-sm font-medium">Your answer</label>
+              <Textarea
+                id="interview-answer"
+                value={currentAnswer}
+                onChange={(event) => {
+                  const answer = event.target.value;
+                  answerVersions.current[currentQuestion.id] = (answerVersions.current[currentQuestion.id] ?? 0) + 1;
+                  latestAnswers.current[currentQuestion.id] = answer;
+                  setAnswers((current) => ({ ...current, [currentQuestion.id]: answer }));
+                  setDirtyAnswers((current) => ({ ...current, [currentQuestion.id]: true }));
+                  setAnswerSaveStatus((current) => ({ ...current, [currentQuestion.id]: "unsaved" }));
+                  setError(null);
+                }}
+                placeholder="Write your answer here…"
+                className="mt-2 min-h-44"
+              />
+              <div className="mt-2 min-h-5 text-right text-xs text-muted-foreground" aria-live="polite">
+                {answerSaveStatus[currentQuestion.id] === "saving" ? "Saving…"
+                  : answerSaveStatus[currentQuestion.id] === "failed" ? "Save failed"
+                    : answerSaveStatus[currentQuestion.id] === "unsaved" ? "Unsaved changes"
+                      : "Answer saved"}
+              </div>
+              <div className="mt-4 flex flex-wrap justify-between gap-3">
+                <Button
+                  variant="outline"
+                  className="rounded-lg"
+                  onClick={() => void saveAndMove(currentQuestionIndex - 1)}
+                  disabled={currentQuestionIndex === 0 || savingAnswer}
+                >
+                  Previous
+                </Button>
+                <Button
+                  className="rounded-lg bg-brand text-primary-foreground hover:bg-brand-deep"
+                  onClick={() => void saveAndMove(currentQuestionIndex + 1)}
+                  disabled={savingAnswer}
+                >
+                  {currentQuestionIndex === questions.length - 1 ? "Complete Interview" : "Next"}
+                  {currentQuestionIndex === questions.length - 1 ? <CircleCheck className="size-4" /> : <ArrowRight className="size-4" />}
+                </Button>
+              </div>
+            </div>
+          ) : activeSession && !questions.length ? (
+            <div className="flex min-h-64 items-center justify-center text-center">
+              <p className="max-w-md text-sm text-muted-foreground">
+                This interview is ready to resume. Start it to load its questions.
+              </p>
+            </div>
+          ) : (
+            <div className="flex min-h-64 flex-col items-center justify-center text-center">
+              <MessageSquareText className="size-8 text-brand" />
+              <p className="mt-4 text-sm text-muted-foreground">
+                {validSelection ? "Your interview questions will appear here after you start." : "Select an analyzed resume and target job to begin."}
+              </p>
+            </div>
+          )}
+        </section>
+      </div>
     </AppShell>
-  );
-}
-function FieldSelect({
-  label,
-  value,
-  options,
-}: {
-  label: string;
-  value: string;
-  options: string[];
-}) {
-  return (
-    <div>
-      <label className="mb-1.5 block text-sm font-medium">{label}</label>
-      <select
-        defaultValue={value}
-        className="flex h-10 w-full rounded-md border border-input bg-card px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-      >
-        {options.map((option) => (
-          <option key={option}>{option}</option>
-        ))}
-      </select>
-    </div>
   );
 }
 
