@@ -81,6 +81,10 @@ import {
   type JobMatch,
 } from "@/lib/job-matching-service";
 import { generateInterviewQuestions, type InterviewQuestionRecord } from "@/lib/interview-service";
+import {
+  evaluateInterview,
+  type InterviewEvaluationResult,
+} from "@/lib/interview-evaluation";
 import { generateCareerRoadmap, type CareerRoadmap } from "@/lib/career-roadmap";
 import { calculateSkillGap, type SkillGapResult } from "@/lib/skill-gap";
 import { normalizeSkill } from "@/lib/job-matching";
@@ -1576,7 +1580,29 @@ export function RoadmapPage() {
   );
 }
 
+function parseStoredInterviewEvaluation(value: unknown): InterviewEvaluationResult["evaluation"] | null {
+  if (typeof value !== "object" || value === null) return null;
+  const candidate = value as Record<string, unknown>;
+  const isStringArray = (items: unknown): items is string[] =>
+    Array.isArray(items) && items.every((item) => typeof item === "string");
+  if (
+    typeof candidate["overall_score"] !== "number" || !Number.isInteger(candidate["overall_score"]) ||
+    candidate["overall_score"] < 0 || candidate["overall_score"] > 100 ||
+    typeof candidate["summary"] !== "string" || !candidate["summary"].trim() ||
+    !isStringArray(candidate["strengths"]) || !isStringArray(candidate["improvement_areas"]) ||
+    !isStringArray(candidate["recommendations"])
+  ) return null;
+  return {
+    overall_score: candidate["overall_score"],
+    summary: candidate["summary"],
+    strengths: candidate["strengths"],
+    improvement_areas: candidate["improvement_areas"],
+    recommendations: candidate["recommendations"],
+  };
+}
+
 export function InterviewPage() {
+  type OverallEvaluation = InterviewEvaluationResult["evaluation"];
   type InterviewSession = {
     id: string;
     user_id: string;
@@ -1585,6 +1611,8 @@ export function InterviewPage() {
     target_role: string | null;
     interview_type: string;
     status: "created" | "in_progress" | "completed";
+    evaluation?: unknown;
+    evaluation_model?: string | null;
   };
   type InterviewQuestion = InterviewQuestionRecord & { user_answer: string | null };
 
@@ -1596,6 +1624,9 @@ export function InterviewPage() {
   const [interviewType, setInterviewType] = useState("technical");
   const [activeSession, setActiveSession] = useState<InterviewSession | null>(null);
   const [questions, setQuestions] = useState<InterviewQuestion[]>([]);
+  const [evaluationResult, setEvaluationResult] = useState<OverallEvaluation | null>(null);
+  const [evaluationStatus, setEvaluationStatus] = useState<"idle" | "evaluating" | "ready" | "failed">("idle");
+  const [evaluationError, setEvaluationError] = useState<string | null>(null);
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [dirtyAnswers, setDirtyAnswers] = useState<Record<string, boolean>>({});
   const [answerSaveStatus, setAnswerSaveStatus] = useState<Record<string, "unsaved" | "saving" | "saved" | "failed">>({});
@@ -1694,6 +1725,9 @@ export function InterviewPage() {
       setQuestions([]);
       setAnswers({});
       setDirtyAnswers({});
+      setEvaluationResult(null);
+      setEvaluationStatus("idle");
+      setEvaluationError(null);
       setSessionLoading(false);
       return;
     }
@@ -1704,12 +1738,12 @@ export function InterviewPage() {
     const restoreSession = async () => {
       const { data: session, error: sessionError } = await supabase
         .from("interview_sessions")
-        .select("id, user_id, resume_id, job_id, target_role, interview_type, status")
+        .select("id, user_id, resume_id, job_id, target_role, interview_type, status, evaluation, evaluation_model")
         .eq("user_id", user.id)
         .eq("resume_id", selectedResumeId)
         .eq("job_id", selectedJobId)
         .eq("interview_type", interviewType)
-        .in("status", ["created", "in_progress"])
+        .in("status", ["created", "in_progress", "completed"])
         .order("created_at", { ascending: false })
         .limit(1)
         .maybeSingle<InterviewSession>();
@@ -1720,6 +1754,9 @@ export function InterviewPage() {
           setQuestions([]);
           setAnswers({});
           setDirtyAnswers({});
+          setEvaluationResult(null);
+          setEvaluationStatus("idle");
+          setEvaluationError(null);
         }
         return;
       }
@@ -1752,6 +1789,18 @@ export function InterviewPage() {
       setAnswerSaveStatus({});
       answerVersions.current = {};
       setCurrentQuestionIndex(0);
+      if (restoredSession.status === "completed") {
+        const storedEvaluation = restoredSession.evaluation_model?.trim()
+          ? parseStoredInterviewEvaluation(restoredSession.evaluation)
+          : null;
+        setEvaluationResult(storedEvaluation);
+        setEvaluationStatus(storedEvaluation ? "ready" : "failed");
+        setEvaluationError(storedEvaluation ? null : "Your interview is complete, but evaluation is unavailable. Retry to try again.");
+      } else {
+        setEvaluationResult(null);
+        setEvaluationStatus("idle");
+        setEvaluationError(null);
+      }
     };
 
     void restoreSession()
@@ -1859,10 +1908,37 @@ export function InterviewPage() {
       setAnswerSaveStatus({});
       answerVersions.current = {};
       setCurrentQuestionIndex(0);
+      setEvaluationResult(null);
+      setEvaluationStatus("idle");
+      setEvaluationError(null);
     } catch (startError) {
       setError(startError instanceof Error ? startError.message : "We could not start the interview. Please try again.");
     } finally {
       setStarting(false);
+    }
+  };
+
+  const evaluateCompletedSession = async (sessionId: string, regenerate = false) => {
+    setEvaluationStatus("evaluating");
+    setEvaluationError(null);
+    try {
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError || !sessionData.session) {
+        setEvaluationResult(null);
+        setEvaluationStatus("failed");
+        setEvaluationError("Your interview is complete, but evaluation could not be loaded. Please sign in and retry.");
+        return;
+      }
+      const result = await evaluateInterview({
+        data: regenerate ? { sessionId, regenerate: true } : { sessionId },
+        headers: { Authorization: `Bearer ${sessionData.session.access_token}` },
+      });
+      setEvaluationResult(result.evaluation);
+      setEvaluationStatus("ready");
+    } catch {
+      setEvaluationResult(null);
+      setEvaluationStatus("failed");
+      setEvaluationError("Your interview is complete, but evaluation could not be loaded. Retry to try again.");
     }
   };
 
@@ -1895,6 +1971,7 @@ export function InterviewPage() {
           .maybeSingle();
         if (completionError || !updatedSession) throw new Error("Your final answer was saved, but the interview could not be completed. Please try again.");
         setActiveSession({ ...activeSession, status: "completed" });
+        await evaluateCompletedSession(activeSession.id);
       } else {
         setCurrentQuestionIndex(nextIndex);
       }
@@ -1994,10 +2071,10 @@ export function InterviewPage() {
               <Button
                 className="w-full rounded-lg bg-brand text-primary-foreground hover:bg-brand-deep"
                 onClick={() => void startInterview()}
-                disabled={!validSelection || dataLoading || sessionLoading || starting || (hasQuestionSet && activeSession?.status !== "completed")}
+                disabled={!validSelection || dataLoading || sessionLoading || starting || activeSession?.status === "completed"}
               >
                 <Play className="size-4" />
-                {starting ? "Starting Interview…" : activeSession && questions.length !== 8 ? "Continue Interview" : "Start Interview"}
+                {starting ? "Starting Interview…" : activeSession?.status === "completed" ? "Interview Completed" : activeSession && questions.length !== 8 ? "Continue Interview" : "Start Interview"}
               </Button>
             </div>
           )}
@@ -2008,11 +2085,59 @@ export function InterviewPage() {
           {dataLoading || sessionLoading ? (
             <p className="text-sm text-muted-foreground" aria-busy="true">Loading interview session…</p>
           ) : activeSession?.status === "completed" ? (
-            <div className="mx-auto flex min-h-64 max-w-xl flex-col items-center justify-center text-center">
-              <CircleCheck className="size-10 text-success" />
-              <h2 className="mt-4 font-display text-2xl font-semibold">Interview complete</h2>
-              <p className="mt-2 text-sm text-muted-foreground">Your answers have been saved.</p>
-              <Button className="mt-6 rounded-lg bg-brand text-primary-foreground hover:bg-brand-deep" onClick={beginAnotherInterview}>
+            <div className="mx-auto max-w-2xl">
+              <div className="flex items-center gap-3">
+                {evaluationStatus === "evaluating" ? (
+                  <span className="size-8 animate-spin rounded-full border-2 border-brand border-r-transparent" aria-hidden="true" />
+                ) : (
+                  <CircleCheck className="size-8 text-success" />
+                )}
+                <div>
+                  <h2 className="font-display text-2xl font-semibold">Interview completed</h2>
+                  <p className="mt-1 text-sm text-muted-foreground">Your answers have been saved.</p>
+                </div>
+              </div>
+
+              {evaluationStatus === "evaluating" ? (
+                <p className="mt-7 text-sm text-muted-foreground" aria-live="polite" aria-busy="true">
+                  Evaluating your interview...
+                </p>
+              ) : evaluationStatus === "ready" && evaluationResult ? (
+                <div className="mt-7 space-y-5">
+                  <div className="rounded-xl border border-line bg-paper/35 p-4">
+                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-brand">Overall score</p>
+                    <p className="mt-2 font-display text-3xl font-semibold">{evaluationResult.overall_score}<span className="ml-1 text-base text-muted-foreground">/ 100</span></p>
+                    <p className="mt-3 text-sm leading-relaxed text-muted-foreground">{evaluationResult.summary}</p>
+                  </div>
+                  {([
+                    ["Strengths", evaluationResult.strengths],
+                    ["Improvement areas", evaluationResult.improvement_areas],
+                    ["Recommendations", evaluationResult.recommendations],
+                  ] as const).map(([heading, items]) => (
+                    <div key={heading}>
+                      <h3 className="text-sm font-semibold">{heading}</h3>
+                      {items.length ? (
+                        <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                          {items.map((item, index) => <li key={`${heading}-${index}`}>{item}</li>)}
+                        </ul>
+                      ) : <p className="mt-2 text-sm text-muted-foreground">None identified.</p>}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="mt-7 rounded-lg border border-warning/20 bg-warning/10 p-4">
+                  <p className="text-sm text-warning" role="alert">{evaluationError ?? "Evaluation is unavailable."}</p>
+                  <Button
+                    variant="outline"
+                    className="mt-3 rounded-lg"
+                    onClick={() => void evaluateCompletedSession(activeSession.id, true)}
+                  >
+                    Retry evaluation
+                  </Button>
+                </div>
+              )}
+
+              <Button variant="outline" className="mt-7 rounded-lg" onClick={beginAnotherInterview}>
                 Start Another Interview
               </Button>
             </div>
